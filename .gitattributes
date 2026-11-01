@@ -1,0 +1,5 @@
+# bat/vbs храним как есть (CRLF), иначе cmd ломается
+*.bat -text
+*.vbs -text
+*.ico binary
+*.png binary

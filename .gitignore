@@ -1,0 +1,12 @@
+# Личное — никогда не публикуется
+.env
+data.db
+data.db-journal
+user.session
+user.session-journal
+*.session
+bot.log
+app.log
+backup/
+__pycache__/
+*.pyc

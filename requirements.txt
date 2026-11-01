@@ -1,0 +1,7 @@
+aiogram>=3.20,<4
+telethon>=1.45
+curl_cffi>=0.14
+python-dotenv>=1.0
+matplotlib>=3.8
+pystray>=0.19
+pillow>=10
