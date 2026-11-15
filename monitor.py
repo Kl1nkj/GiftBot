@@ -32,11 +32,12 @@ def fmt_price(item: Listing) -> str:
 
 
 def format_listing(
-    item: Listing, analysis: Analysis | None = None, hit_id: int | None = None, deal: bool = False
+    item: Listing, analysis: Analysis | None = None, hit_id: int | None = None, deal: bool | str = False
 ) -> tuple[str, InlineKeyboardMarkup]:
     title = html.escape(item.collection) + (f" #{item.number}" if item.number is not None else "")
     lines = [
-        *(["🔥 <b>Выгодный лот</b>"] if deal else []),
+        *(["💎 <b>Красивый номер почти по цене обычного</b>"] if deal == "number"
+          else ["🔥 <b>Выгодный лот</b>"] if deal else []),
         f"🎁 <b>{title}</b>",
         f"💰 <b>{html.escape(fmt_price(item))}</b>",
         f"🏪 {MARKETS.get(item.market, item.market)}",
@@ -167,9 +168,20 @@ class Monitor:
                     analysis = await self._analyze(item, fresh=True)
                     if analysis and analysis.verdict == "buy":
                         await self._notify(item, analysis, deal=True)
+                    elif analysis and deals["numbers"] and self._cheap_number(item, analysis):
+                        await self._notify(item, analysis, deal="number")
             except Exception as e:
                 log.warning("%s notify: %s", source.name, e)
         self.storage.mark_seen(unseen)
+
+    @staticmethod
+    def _cheap_number(item: Listing, a: Analysis) -> bool:
+        """Красивый номер (повтор 183183, 7777, круглый, до #1000), выставленный не дороже обычных таких же:
+        запас тут не в цене модели, а в доплате коллекционеров за номер — поэтому шлём отдельным типом."""
+        if a.number_tier < 2 or not a.ok or a.still_listed is False:
+            return False
+        ref = a.sales_median if a.sales_n >= 3 else a.model_floor
+        return bool(ref) and item.price <= ref * 1.05
 
     async def _worth_details(self, item: Listing) -> bool:
         """Для охотника не грузим страницу каждого лота Fragment — только недорогие относительно коллекции."""
@@ -186,7 +198,7 @@ class Monitor:
             log.warning("анализ %s: %s", item.key, e)
             return None
 
-    async def _notify(self, item: Listing, analysis: Analysis | None = None, deal: bool = False) -> None:
+    async def _notify(self, item: Listing, analysis: Analysis | None = None, deal: bool | str = False) -> None:
         hit_id = self.storage.add_hit(
             {
                 "deal": deal,
@@ -217,7 +229,7 @@ class Monitor:
             except Exception as e:  # например, владелец ещё не нажал /start у бота
                 log.warning("не удалось отправить %s: %s", chat_id, e)
         self.sent_total += 1
-        self.deals_total += deal
+        self.deals_total += bool(deal)
 
     async def _send(self, chat_id: int, text: str, keyboard, image: str | None) -> None:
         if image:

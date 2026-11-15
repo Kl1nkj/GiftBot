@@ -388,6 +388,10 @@ def hunt_keyboard(settings: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=("✅ " if settings["only_liquid"] else "▫️ ") + "Только ликвидные", callback_data="hu:liq"
         )],
+        [InlineKeyboardButton(
+            text=("✅ " if settings["numbers"] else "▫️ ") + "💎 Красивые номера по цене обычных",
+            callback_data="hu:num",
+        )],
     ])
 
 
@@ -424,6 +428,8 @@ async def hunt_cb(cb: CallbackQuery, monitor: Monitor):
         settings = analyzer.save_deal_settings({"min_roi": float(parts[2])})
     elif parts[1] == "liq":
         settings = analyzer.save_deal_settings({"only_liquid": not settings["only_liquid"]})
+    elif parts[1] == "num":
+        settings = analyzer.save_deal_settings({"numbers": not settings["numbers"]})
     try:
         await cb.message.edit_text(hunt_text(settings), reply_markup=hunt_keyboard(settings))
     except Exception as e:  # «message is not modified»

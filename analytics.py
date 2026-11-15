@@ -27,7 +27,7 @@ from datetime import datetime
 from curl_cffi.requests import AsyncSession
 
 from config import MARKETAPP_API_TOKEN, SELL_FEES, TRANSFER_COST_TON
-from models import MARKETS, Listing, is_ton, lot_url, norm, portals_collection_url, slugify, strip_rarity
+from models import MARKETS, Listing, is_ton, lot_url, number_pattern, norm, portals_collection_url, slugify, strip_rarity
 from sales import SalesHistory, SalesSummary, sale_to_dict
 from storage import Storage
 
@@ -148,6 +148,7 @@ class Analysis:
     value_floor: float | None = None  # нижняя граница цены с учётом всех признаков
     upside_profit: float | None = None  # прибыль, если продавать по цене признаков (дольше)
     features: list[str] = field(default_factory=list)  # «почему дороже»
+    number_tier: int = 0  # насколько красивый номер: 0 — обычный … 3 — топ (models.number_pattern)
     # реальные продажи модели за 30 дней
     sales_n: int = 0
     sales_median: float | None = None
@@ -238,6 +239,8 @@ class Analyzer:
             "min_discount": float(s.get_setting("deals_min_discount", "7")),
             "max_price": float(v) if (v := s.get_setting("deals_max_price", "")) else None,
             "only_liquid": s.get_setting("deals_only_liquid", "1") == "1",
+            # присылать красивые номера, выставленные почти по цене обычных
+            "numbers": s.get_setting("deals_numbers", "1") == "1",
         }
 
     def save_deal_settings(self, data: dict) -> dict:
@@ -252,6 +255,8 @@ class Analyzer:
             s.set_setting("deals_max_price", "" if v in (None, "") else str(float(v)))
         if "only_liquid" in data:
             s.set_setting("deals_only_liquid", "1" if data["only_liquid"] else "0")
+        if "numbers" in data:
+            s.set_setting("deals_numbers", "1" if data["numbers"] else "0")
         return self.deal_settings()
 
     # ---------- данные ----------
@@ -492,7 +497,10 @@ class Analyzer:
             ref, _ = self.usual_price(item.collection, item.model)
         if ref is None:
             return False
-        # не дороже флора модели: только такие лоты можно перепродать с наценкой
+        # не дороже флора модели: только такие лоты можно перепродать с наценкой;
+        # красивому номеру даём запас 5% — за номер доплачивают сверх цены модели
+        if settings.get("numbers") and number_pattern(item.number)[0] >= 2:
+            return item.price <= ref * 1.05
         return item.price <= ref
 
     # ---------- полный анализ ----------
@@ -704,13 +712,9 @@ class Analyzer:
             f.append(f"с этим фоном модель продают от {a.combo_floor:g} TON, а в среднем от {a.model_floor:g} — "
                      f"сочетание ценится дороже (часто это монохром или удачные цвета)")
 
-        if item.number is not None:
-            if item.number <= 100:
-                f.append(f"очень низкий номер #{item.number}")
-            elif item.number <= 1000:
-                f.append(f"низкий номер #{item.number}")
-            elif re.fullmatch(r"(\d)\1{2,}", str(item.number)):
-                f.append(f"красивый номер #{item.number}")
+        a.number_tier, label = number_pattern(item.number)
+        if label:
+            f.append(label + (" — за такие часто доплачивают" if a.number_tier >= 2 else ""))
 
         # нижняя граница цены: подарок с этими признаками не бывает дешевле самого дешёвого из них
         # одиночный лот связки — часто просто завышенная цена, на него не опираемся

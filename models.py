@@ -33,6 +33,35 @@ def strip_rarity(value: str | None) -> str | None:
     return _PERCENT_RE.sub("", value).strip() if value else value
 
 
+def number_pattern(n: int | None) -> tuple[int, str | None]:
+    """Насколько «красивый» номер подарка: (уровень 0–3, описание). Коллекционеры за такие часто доплачивают.
+    3 — топ (#1–#100, одинаковые цифры 7777), 2 — заметный (повтор 183183, круглый 50000, 1234, до #1000),
+    1 — слабый (зеркальный 12321, оканчивается на 000)."""
+    if n is None or n <= 0:
+        return 0, None
+    s = str(n)
+    if n <= 100:
+        return 3, f"очень низкий номер #{n}"
+    if len(s) >= 3 and len(set(s)) == 1:
+        return 3, f"одинаковые цифры #{n}"
+    for size in range(1, len(s) // 2 + 1):  # 183183, 1212, 121212
+        if len(s) % size == 0 and s == s[:size] * (len(s) // size):
+            return 2, f"повторяющийся номер #{n} ({'-'.join([s[:size]] * (len(s) // size))})"
+    if len(s) >= 4 and s[1:] == "0" * (len(s) - 1):
+        return 2, f"круглый номер #{n}"
+    digits = [int(c) for c in s]
+    steps = {b - a for a, b in zip(digits, digits[1:])}
+    if len(s) >= 4 and steps in ({1}, {-1}):
+        return 2, f"номер-последовательность #{n}"
+    if n <= 1000:
+        return 2, f"низкий номер #{n}"
+    if len(s) >= 4 and s == s[::-1]:
+        return 1, f"зеркальный номер #{n}"
+    if len(s) >= 5 and s.endswith("000"):
+        return 1, f"номер на 000 — #{n}"
+    return 0, None
+
+
 def lot_url(market: str, item_id: str) -> str | None:
     """Ссылка прямо на лот в маркете — тот же формат, что у их кнопки «Поделиться»."""
     if market == "portals":
