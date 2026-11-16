@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
 
 from analytics import Offer, _ton  # noqa: E402
-from models import MARKETS, slugify  # noqa: E402
+from models import MARKETS, norm, slugify  # noqa: E402
 from sales import Sale, SalesSummary  # noqa: E402
 
 COLORS = {"portals": "#3b82f6", "tonnel": "#a855f7", "fragment": "#22c55e", "mrkt": "#f59e0b", "telegram": "#06b6d4",
@@ -30,7 +30,7 @@ def fragment_model_url(collection: str, model: str) -> str:
 
 def model_chart(
     title: str, series: list[tuple[int, str, float]], offers: list[Offer], price: float | None,
-    sales: list[Sale] | None = None,
+    sales: list[Sale] | None = None, backdrop: str | None = None, own_sale: tuple[int, float] | None = None,
 ) -> bytes | None:
     """Треугольники — реальные сделки (за сколько купили); кружки — лоты, которые продаются сейчас,
     по дате выставления (слева — висят давно, не покупают); точки — цены новых лотов, которые бот видел раньше;
@@ -55,6 +55,15 @@ def model_chart(
             [datetime.fromtimestamp(ts) for ts, _ in pts], [p for _, p in pts], s=70, facecolors="none",
             linewidths=1.6, edgecolors=COLORS.get(market, "#9ca3af"), label=f"{MARKETS.get(market, market)} — в продаже",
         )
+    # самые близкие аналоги — сделки с тем же фоном: крупные звёзды поверх остальных
+    same = [s for s in sales if backdrop and norm(s.backdrop) == norm(backdrop)]
+    if same:
+        ax.scatter([datetime.fromtimestamp(s.ts) for s in same], [s.price for s in same], s=190, marker="*",
+                   color="#facc15", edgecolors="#78350f", linewidths=0.8, zorder=5,
+                   label=f"купили с фоном {backdrop}")
+    if own_sale:
+        ax.scatter([datetime.fromtimestamp(own_sale[0])], [own_sale[1]], s=140, marker="D", color="#f472b6",
+                   edgecolors="white", linewidths=1, zorder=6, label="этот подарок — прошлая продажа")
     for market in sorted({s.market for s in sales}):
         pts = [s for s in sales if s.market == market]
         ax.scatter(
@@ -62,7 +71,8 @@ def model_chart(
             color=COLORS.get(market, "#9ca3af"), edgecolors="white", linewidths=0.6,
             label=f"{MARKETS.get(market, market.capitalize())} — купили",
         )
-    first = min([ts for ts, _, _ in series] + [ts for ts, _, _ in current] + [s.ts for s in sales] + [now - 86400])
+    first = min([ts for ts, _, _ in series] + [ts for ts, _, _ in current] + [s.ts for s in sales]
+                + ([own_sale[0]] if own_sale else []) + [now - 86400])
     pad = max(3600, (now - first) * 0.04)
     ax.set_xlim(datetime.fromtimestamp(first - pad), datetime.fromtimestamp(now + pad))
     if offers:
@@ -89,7 +99,7 @@ def model_chart(
 def format_model_overview(
     collection: str, model: str, offers: list[Offer], failed: list[str],
     series: list[tuple[int, str, float]], coll_url: str | None, self_id: str | None = None,
-    sales: SalesSummary | None = None,
+    sales: SalesSummary | None = None, backdrop: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     lines = [f"👀 <b>{html.escape(collection)} · {html.escape(model)}</b> — все такие в продаже"]
     if not offers:
@@ -113,12 +123,18 @@ def format_model_overview(
             f"💸 <b>Реально купили за 30 дн.: {len(prices)}</b> раз, середина <b>{_ton(prices[len(prices) // 2])} TON</b>, "
             f"от {_ton(prices[0])} до {_ton(prices[-1])}. Последние:"
         )
+        same = [s.price for s in sales.sales if backdrop and norm(s.backdrop) == norm(backdrop)]
+        if same:
+            same.sort()
+            lines.append(f"⭐ С фоном {html.escape(backdrop)}: {len(same)} сделок, середина "
+                         f"<b>{_ton(same[len(same) // 2])} TON</b> — самые близкие аналоги")
         for s in sales.sales[:8]:
             ago = (time.time() - s.ts) / 86400
             when = "сегодня" if ago < 1 else f"{ago:.0f} дн. назад"
             extra = " · ".join(html.escape(x) for x in (s.backdrop, s.symbol) if x)
             num = f"#{s.number} " if s.number else ""
-            lines.append(f"• {_ton(s.price)} TON — {MARKETS.get(s.market, s.market.capitalize())}, {when}"
+            star = "⭐ " if backdrop and norm(s.backdrop) == norm(backdrop) else "• "
+            lines.append(f"{star}{_ton(s.price)} TON — {MARKETS.get(s.market, s.market.capitalize())}, {when}"
                          f"{f' ({num}{extra})' if num or extra else ''}")
     elif sales is not None and not sales.missing and not sales.failed:
         lines.append("")
@@ -138,7 +154,8 @@ def format_model_overview(
     lines.append("")
     lines.append(
         "<i>В скобках — сколько дней лот висит: долго висящий лот = по этой цене не покупают. "
-        "На графике ▲ — реальные сделки, ○ — лоты в продаже сейчас, • — цены выставления, которые видел бот.</i>"
+        "На графике ▲ — реальные сделки, ⭐ — сделки с тем же фоном, ◆ — прошлая продажа этого подарка, "
+        "○ — лоты в продаже сейчас, • — цены выставления, которые видел бот.</i>"
     )
     rows = [[InlineKeyboardButton(text="🔎 Эта модель на Fragment", url=fragment_model_url(collection, model))]]
     if coll_url:

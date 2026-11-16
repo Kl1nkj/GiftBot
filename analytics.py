@@ -73,6 +73,9 @@ STALE_DAYS = 7
 # Флор «одинокий», если следующий лот дороже него больше чем на столько — рынок модели редкий
 THIN_GAP = 0.25
 
+# Ориентир доплаты за красивый номер (верхняя граница оценки, не идёт в расчёт прибыли)
+NUMBER_PREMIUM = {3: 1.5, 2: 1.2, 1: 1.05}
+
 # Признак редкий, если он в самой редкой четверти своей коллекции (у разных коллекций разная шкала)
 RARE_QUANTILE = 0.25
 # Во сколько раз флор признака выше флора коллекции, чтобы назвать его «дорогим»
@@ -149,6 +152,16 @@ class Analysis:
     upside_profit: float | None = None  # прибыль, если продавать по цене признаков (дольше)
     features: list[str] = field(default_factory=list)  # «почему дороже»
     number_tier: int = 0  # насколько красивый номер: 0 — обычный … 3 — топ (models.number_pattern)
+    # класс лота: top | number | rare | common и за что
+    grade: str = "common"
+    grade_why: list[str] = field(default_factory=list)
+    # оценка рынка — сколько лот стоит по данным, а не сколько за него просят
+    fair: float | None = None
+    fair_high: float | None = None  # сколько можно просить с учётом номера (ориентир, продаётся дольше)
+    fair_basis: str | None = None
+    fair_discount: float | None = None  # насколько лот дешевле оценки
+    combo_sales_n: int = 0  # сделки с той же моделью и тем же фоном
+    combo_sales_median: float | None = None
     # реальные продажи модели за 30 дней
     sales_n: int = 0
     sales_median: float | None = None
@@ -596,6 +609,8 @@ class Analyzer:
         a.profit = round(a.net - item.price, 3)
         a.roi = a.profit / item.price
 
+        self._fair_value(item, a)
+
         if a.value_floor and a.value_floor > target * 1.05:
             a.upside_profit = round(_undercut(a.value_floor) * (1 - best[2]) - best[3] - item.price, 3)
 
@@ -663,6 +678,9 @@ class Analyzer:
             a.sales_markets[s.market] = a.sales_markets.get(s.market, 0) + 1
         a.sales_list = [sale_to_dict(s) for s in sales.sales[:10]]
         a.discount_sales = 1 - item.price / a.sales_median
+        same = [s.price for s in sales.sales if item.backdrop and norm(s.backdrop) == norm(item.backdrop)]
+        if same:
+            a.combo_sales_n, a.combo_sales_median = len(same), round(statistics.median(same), 3)
 
     async def _features(self, item: Listing, a: Analysis) -> None:
         """Объясняет цену: редкость модели/фона/символа, дорогие фон и символ, монохром, связка, номер."""
@@ -692,29 +710,48 @@ class Analyzer:
         def is_rare(kind: str, value: float | None) -> bool:
             return value is not None and kind in rare and value <= rare[kind]
 
+        why = a.grade_why  # короткие метки для класса лота
         if is_rare("models", a.rarity_model):
             f.append(f"редкая модель {item.model} — {a.rarity_model:g}% выпуска")
+            why.append("редкая модель")
         if is_rare("backdrops", a.rarity_backdrop):
             f.append(f"редкий фон {item.backdrop} — {a.rarity_backdrop:g}%")
+            why.append("редкий фон")
         if is_rare("symbols", a.rarity_symbol):
             f.append(f"редкий символ {item.symbol} — {a.rarity_symbol:g}%")
+            why.append("редкий символ")
         if coll_floor and a.floor_backdrop and a.floor_backdrop >= coll_floor * PREMIUM_RATIO:
             f.append(f"фон {item.backdrop} в этой коллекции дешевле {a.floor_backdrop:g} TON не продают "
                      f"(×{a.floor_backdrop / coll_floor:.1f} к флору)")
+            why.append("дорогой фон")
         if coll_floor and a.floor_symbol and a.floor_symbol >= coll_floor * PREMIUM_RATIO:
             f.append(f"символ {item.symbol} дешевле {a.floor_symbol:g} TON не продают "
                      f"(×{a.floor_symbol / coll_floor:.1f} к флору)")
+            why.append("дорогой символ")
 
         fam_b = color_family(item.backdrop)
         if fam_b and fam_b in (color_family(item.model), color_family(item.symbol)):
             f.append(f"похоже на монохром — {fam_b} фон в цвет модели/символа, такие ценятся выше")
+            why.append("монохром")
         if a.combo_floor and a.combo_count >= 2 and a.model_floor and a.combo_floor >= a.model_floor * 1.15:
             f.append(f"с этим фоном модель продают от {a.combo_floor:g} TON, а в среднем от {a.model_floor:g} — "
                      f"сочетание ценится дороже (часто это монохром или удачные цвета)")
+            why.append("ценное сочетание")
 
         a.number_tier, label = number_pattern(item.number)
         if label:
             f.append(label + (" — за такие часто доплачивают" if a.number_tier >= 2 else ""))
+        if a.number_tier >= 2:
+            why.insert(0, f"номер #{item.number}")
+
+        # класс лота: номер весит больше всего, остальные признаки добавляют по очку
+        points = {3: 3, 2: 2}.get(a.number_tier, 0) + len(why) - (a.number_tier >= 2)
+        if a.number_tier == 3 or points >= 4 or (a.number_tier == 2 and points >= 3):
+            a.grade = "top"
+        elif a.number_tier >= 2:
+            a.grade = "number"
+        elif why:
+            a.grade = "rare"
 
         # нижняя граница цены: подарок с этими признаками не бывает дешевле самого дешёвого из них
         # одиночный лот связки — часто просто завышенная цена, на него не опираемся
@@ -726,6 +763,30 @@ class Analyzer:
         a.value_floor = max(bounds) if bounds else None
         if a.value_floor and a.sales_n >= MIN_SALES:  # дороже самой дорогой сделки не закладываем
             a.value_floor = min(a.value_floor, a.sales_max)
+
+    @staticmethod
+    def _fair_value(item: Listing, a: Analysis) -> None:
+        """Оценка рынка: сделки → цена в продаже → история; поднимается до цены связки «модель+фон»
+        и дорогих фона/символа. Верхняя граница — с доплатой за красивый номер (ориентир)."""
+        stale = a.floor_age is not None and a.floor_age > STALE_DAYS
+        if a.sales_n >= MIN_SALES:
+            base, a.fair_basis = a.sales_median, f"по {a.sales_n} сделкам за 30 дн."
+        elif a.model_floor and not stale and not a.thin:
+            base, a.fair_basis = a.model_floor, "по самой дешёвой цене в продаже (сделок мало)"
+        elif a.usual:
+            base, a.fair_basis = a.usual, "по ценам выставления за 7 дн."
+        else:
+            return
+        if a.combo_sales_n >= 2 and a.combo_sales_median > base:
+            base, a.fair_basis = a.combo_sales_median, f"по {a.combo_sales_n} сделкам с этим же фоном"
+        elif a.value_floor and a.value_floor > base:
+            base = a.value_floor
+            a.fair_basis += ", с учётом фона/символа"
+        a.fair = round(base, 2)
+        premium = NUMBER_PREMIUM.get(a.number_tier, 1.0)
+        if premium > 1:
+            a.fair_high = round(a.fair * premium, 2)
+        a.fair_discount = 1 - item.price / a.fair
 
     def _verdict(self, a: Analysis) -> tuple[str, list[str]]:
         s = self.deal_settings()
@@ -796,6 +857,19 @@ async def _empty() -> tuple[list[Offer], list[str]]:
     return [], []
 
 
+GRADES = {
+    "top": "🏆 Топ-лот",
+    "number": "💎 Красивый номер",
+    "rare": "✨ Редкий",
+    "common": "▫️ Обычный",
+}
+
+
+def grade_line(a: "Analysis") -> str:
+    why = f" · {', '.join(a.grade_why)}" if a.grade_why else ""
+    return f"<b>{GRADES.get(a.grade, GRADES['common'])}</b>{why}"
+
+
 VERDICTS = {
     "buy": "🟢 Брать — перепродажа в плюс",
     "maybe": "🟡 Можно, но есть риски",
@@ -819,6 +893,13 @@ def _pct(v: float) -> str:
 def format_analysis(item: Listing, a: Analysis) -> str:
     """Блок анализа для уведомления в Telegram (HTML)."""
     lines = ["", "📊 <b>Анализ</b>"]
+    if a.fair is not None:
+        d = a.fair_discount or 0
+        rel = f"лот на <b>{abs(d) * 100:.0f}% {'дешевле' if d > 0 else 'дороже'}</b> оценки" if abs(d) >= 0.01 \
+            else "лот стоит ровно по оценке"
+        lines.append(f"🧮 <b>Оценка рынка: ~{_ton(a.fair)} TON</b> ({a.fair_basis}) — {rel}")
+        if a.fair_high:
+            lines.append(f"За номер можно просить до ~{_ton(a.fair_high)} TON (ориентир, продаётся дольше)")
     if a.model_floor is not None:
         cnt = f", рядом с ним ещё {a.near_floor - 1}" if a.near_floor > 1 else ""
         age = f", висит {a.floor_age:.0f} дн." if a.floor_age is not None and a.floor_age >= 1 else ""
@@ -851,6 +932,8 @@ def format_analysis(item: Listing, a: Analysis) -> str:
         lines.append("📱 Telegram: " + ", ".join(parts))
     if a.combo_floor is not None:
         lines.append(f"Та же модель с этим фоном: от {_ton(a.combo_floor)} TON ({a.combo_count} в продаже)")
+    if a.combo_sales_n:
+        lines.append(f"С этим же фоном купили {a.combo_sales_n} раз, середина {_ton(a.combo_sales_median)} TON")
     if a.usual is not None:
         lines.append(f"Обычно выставляют: ~{_ton(a.usual)} TON (медиана за 7 дн., {a.usual_n} лотов)")
     if a.discount_sales is not None and a.sales_n >= MIN_SALES:

@@ -177,6 +177,12 @@
   .detail-pic img { width: 100%; height: 100%; object-fit: cover; }
   .detail-title { padding: 14px 16px 2px; font-size: 20px; font-weight: 700; }
   .detail-sub { padding: 0 16px; color: var(--muted); font-size: 13px; }
+  .grade { display: inline-block; margin: 8px 16px 0; padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600;
+           background: var(--bg2, rgba(127,127,127,.15)); }
+  .grade.top { background: rgba(250, 204, 21, .22); }
+  .grade.number { background: rgba(59, 130, 246, .22); }
+  .grade.rare { background: rgba(168, 85, 247, .22); }
+  .card .gr { position: absolute; right: 8px; bottom: 6px; font-size: 15px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
   .verdict { margin: 14px 16px 0; border-radius: 14px; padding: 12px 14px; font-weight: 700; }
   .verdict.buy { background: rgba(52,199,89,.15); color: var(--green); }
   .verdict.maybe { background: rgba(255,196,0,.13); color: #ffc400; }
@@ -327,7 +333,8 @@ function renderFeed() {
     <button class="card" data-hit="${i.id}">
       <div class="pic">
         ${i.image ? `<img src="${esc(i.image)}" loading="lazy" alt="">` : ''}
-        <span class="tag">${i.deal ? '🔥 ' : ''}${esc(markets[i.market] || i.market)}</span>
+        <span class="tag">${i.deal === 'number' ? '💎 ' : i.deal ? '🔥 ' : ''}${esc(markets[i.market] || i.market)}</span>
+        ${{top: '<span class="gr">🏆</span>', number: '<span class="gr">💎</span>', rare: '<span class="gr">✨</span>'}[a?.grade] || ''}
         <span class="ago">${ago(i.ts)}</span>
         ${disc}
       </div>
@@ -397,6 +404,8 @@ function findHit(id) {
   return S.feed?.find(h => h.id == id) || S.deals?.find(h => h.id == id);
 }
 
+const GRADE = { top: '🏆 Топ-лот', number: '💎 Красивый номер', rare: '✨ Редкий', common: '▫️ Обычный' };
+
 function renderDetail(h) {
   const a = h.analysis;
   const markets = S.meta?.markets || {};
@@ -408,11 +417,22 @@ function renderDetail(h) {
     </div>
     <div class="detail-pic">${h.image ? `<img src="${esc(h.image)}" alt="">` : ''}<span class="tag">${h.deal ? '🔥 ' : ''}${esc(markets[h.market] || h.market)}</span></div>
     <div class="detail-title">${TON} ${esc((h.price_text || '').replace(/\s*TON$/, ''))} TON</div>
-    <div class="detail-sub">${esc([h.model, h.backdrop, h.symbol].filter(Boolean).join(' · '))} · найден ${agoLong(h.ts)}</div>`;
+    <div class="detail-sub">${esc([h.model, h.backdrop, h.symbol].filter(Boolean).join(' · '))} · найден ${agoLong(h.ts)}</div>
+    ${a ? `<div class="grade ${a.grade || 'common'}">${GRADE[a.grade] || GRADE.common}${a.grade_why?.length ? ' · ' + esc(a.grade_why.join(', ')) : ''}</div>` : ''}`;
   if (!a) {
     html += `<div class="verdict unknown">⚪ Анализа для этого лота нет<ul><li>Нажмите «Пересчитать», чтобы оценить по текущим ценам</li></ul></div>`;
   } else {
     html += `<div class="verdict ${a.verdict}">${VERDICT[a.verdict]}${a.reasons?.length ? `<ul>${a.reasons.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}</div>`;
+    if (a.fair != null) {
+      const d = a.fair_discount || 0;
+      html += `<div class="section-title">Оценка рынка</div><div class="group">
+        ${kv('Стоит примерно', `<b>${fmt(a.fair)} TON</b>`)}
+        ${kv('На чём основана', esc(a.fair_basis || ''))}
+        ${kv('Этот лот', `<span class="${d >= 0 ? 'pos' : 'neg'}">на ${Math.abs(Math.round(d * 100))}% ${d >= 0 ? 'дешевле' : 'дороже'} оценки</span>`)}
+        ${a.fair_high ? kv('За номер можно просить', `до ~${fmt(a.fair_high)} TON · дольше`) : ''}
+        ${a.combo_sales_n ? kv('Сделки с этим же фоном', `${a.combo_sales_n} · середина ${fmt(a.combo_sales_median)} TON`) : ''}
+      </div>`;
+    }
     if (a.ok) {
       html += `<div class="section-title">Перепродажа</div><div class="group">
         ${kv('Купить', `${fmt(h.price)} TON`)}

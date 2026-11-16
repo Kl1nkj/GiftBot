@@ -7,7 +7,7 @@ import time
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from analytics import Analysis, Analyzer, format_analysis
+from analytics import Analysis, Analyzer, format_analysis, grade_line
 from config import OWNER_IDS
 from models import MARKETS, Listing, norm
 from sources.base import Source
@@ -39,6 +39,7 @@ def format_listing(
         *(["💎 <b>Красивый номер почти по цене обычного</b>"] if deal == "number"
           else ["🔥 <b>Выгодный лот</b>"] if deal else []),
         f"🎁 <b>{title}</b>",
+        *([grade_line(analysis)] if analysis is not None else []),
         f"💰 <b>{html.escape(fmt_price(item))}</b>",
         f"🏪 {MARKETS.get(item.market, item.market)}",
     ]

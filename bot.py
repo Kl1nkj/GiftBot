@@ -485,12 +485,14 @@ async def model_overview(cb: CallbackQuery, monitor: Monitor):
     coll_url = (hit.get("analysis") or {}).get("coll_url")
     self_id = str(hit.get("item_id") or "")
     text, keyboard = format_model_overview(
-        hit["collection"], hit["model"], offers, failed, series, coll_url, self_id, sales
+        hit["collection"], hit["model"], offers, failed, series, coll_url, self_id, sales, hit.get("backdrop")
     )
+    tg = (hit.get("analysis") or {}).get("tg") or {}
+    own_sale = (tg["last_sale_ts"], tg["last_sale"]) if tg.get("last_sale") and tg.get("last_sale_ts") else None
     others = [o for o in offers if not (o.market == hit["market"] and o.item_id == self_id)]
     chart = await asyncio.to_thread(
         model_chart, f"{hit['collection']} · {hit['model']}", series, others, hit.get("price"),
-        sales.sales if sales else None,
+        sales.sales if sales else None, hit.get("backdrop"), own_sale,
     )
     if chart and caption_len(text) <= 1024:
         await cb.message.answer_photo(BufferedInputFile(chart, "model.png"), caption=text, reply_markup=keyboard)

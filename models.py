@@ -40,10 +40,13 @@ def number_pattern(n: int | None) -> tuple[int, str | None]:
     if n is None or n <= 0:
         return 0, None
     s = str(n)
+    if n <= 9:
+        return 3, f"легендарный номер #{n} — один из первых"
+    if len(s) >= 2 and len(set(s)) == 1:  # 11, 555, 6666, 77777
+        words = {2: "две", 3: "три", 4: "четыре", 5: "пять", 6: "шесть", 7: "семь"}
+        return 3, f"{words.get(len(s), str(len(s)))} одинаковые цифры #{n}"
     if n <= 100:
         return 3, f"очень низкий номер #{n}"
-    if len(s) >= 3 and len(set(s)) == 1:
-        return 3, f"одинаковые цифры #{n}"
     for size in range(1, len(s) // 2 + 1):  # 183183, 1212, 121212
         if len(s) % size == 0 and s == s[:size] * (len(s) // size):
             return 2, f"повторяющийся номер #{n} ({'-'.join([s[:size]] * (len(s) // size))})"
