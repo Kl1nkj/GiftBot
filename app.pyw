@@ -21,6 +21,8 @@ APP_DIR = Path(__file__).resolve().parent
 os.chdir(APP_DIR)
 ENV = APP_DIR / ".env"
 LOG = APP_DIR / "bot.log"
+ERR_LOG = APP_DIR / "bot.err.log"  # только то, что бот вывел мимо журнала (падение интерпретатора)
+PID_FILE = APP_DIR / "bot.pid"
 ICON = APP_DIR / "icon.ico"
 SINGLE_PORT = 47391  # второе окно не запускаем — показываем уже открытое
 RESTART_DELAY = 10
@@ -53,21 +55,32 @@ def python_exe() -> str:
     return updater._python()
 
 
-def kill_strays(keep_pid: int | None = None) -> None:
-    """Останавливает бота, запущенного старым способом (start_bot.bat), и его туннели."""
-    folder = str(APP_DIR).replace("'", "''")
-    keep = keep_pid or 0
+def kill_tree(pid: int) -> None:
+    """Процесс и всё, что он запустил (туннели), — и ничего чужого."""
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], creationflags=NO_WINDOW, capture_output=True)
+
+
+def kill_strays() -> None:
+    """Останавливает бота из этой папки, запущенного раньше (прошлое окно или старый start_bot.bat).
+    Ищем точно: по bot.pid, который пишет сам бот, и по start_bot.bat именно из этой папки."""
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid and pid != os.getpid():
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            creationflags=NO_WINDOW, capture_output=True, text=True,
+        ).stdout
+        if "bot.py" in out:
+            kill_tree(pid)
+    bat = str(APP_DIR / "start_bot.bat").replace("'", "''").replace("[", "`[").replace("]", "`]")
     script = (
-        "Get-CimInstance Win32_Process | Where-Object { "
-        f"$_.ProcessId -ne {keep} -and ("
-        "($_.Name -eq 'cmd.exe' -and $_.CommandLine -like '*start_bot.bat*') -or "
-        "($_.Name -eq 'python.exe' -and $_.CommandLine -like '*bot.py*') -or "
-        "$_.Name -eq 'cloudflared.exe' -or $_.Name -eq 'ngrok.exe' -or "
-        "($_.Name -eq 'ssh.exe' -and $_.CommandLine -like '*localhost.run*')) "
-        "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and "
+        f"$_.CommandLine -like '*{bat}*' }} | ForEach-Object {{ taskkill /PID $_.ProcessId /T /F }}"
     )
-    subprocess.run(["powershell", "-NoProfile", "-Command", script], creationflags=NO_WINDOW,
-                   capture_output=True, cwd=folder)
+    subprocess.run(["powershell", "-NoProfile", "-Command", script], creationflags=NO_WINDOW, capture_output=True)
 
 
 class BotProcess:
@@ -78,6 +91,8 @@ class BotProcess:
         self.want = False
         self.on_change = on_change
         self.started = 0.0
+        # запуск/остановка из окна и из сторожа одновременно дали бы два bot.py (двойные алерты)
+        self.lock = threading.RLock()
         threading.Thread(target=self._watch, daemon=True).start()
 
     @property
@@ -85,34 +100,42 @@ class BotProcess:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self) -> None:
-        self.want = True
-        if self.running:
-            return
-        kill_strays()
-        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        out = open(LOG, "a", encoding="utf-8")
-        self.proc = subprocess.Popen([python_exe(), "bot.py"], cwd=APP_DIR, stdout=out, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, env=env, creationflags=NO_WINDOW)
-        out.close()
-        self.started = time.time()
-        log.info("бот запущен, pid %s", self.proc.pid)
+        with self.lock:
+            self.want = True
+            if self.running:
+                return
+            kill_strays()
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "GIFTBOT_LOG_FILE": LOG.name}
+            try:
+                if ERR_LOG.exists() and ERR_LOG.stat().st_size > 2_000_000:
+                    ERR_LOG.unlink()
+            except OSError:
+                pass
+            out = open(ERR_LOG, "a", encoding="utf-8")
+            self.proc = subprocess.Popen([python_exe(), "bot.py"], cwd=APP_DIR, stdout=out, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, env=env, creationflags=NO_WINDOW)
+            out.close()
+            self.started = time.time()
+            log.info("бот запущен, pid %s", self.proc.pid)
         self.on_change()
 
     def stop(self) -> None:
-        self.want = False
-        if self.running:
-            self.proc.terminate()
-            try:
-                self.proc.wait(10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        kill_strays()  # туннели, которые бот запустил, сами не закрываются
-        log.info("бот остановлен")
+        with self.lock:
+            self.want = False
+            if self.running:
+                kill_tree(self.proc.pid)  # вместе с туннелями, которые бот запустил
+                try:
+                    self.proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            kill_strays()
+            log.info("бот остановлен")
         self.on_change()
 
     def restart(self) -> None:
-        self.stop()
-        self.start()
+        with self.lock:
+            self.stop()
+            self.start()
 
     def _watch(self) -> None:
         while True:
@@ -121,8 +144,9 @@ class BotProcess:
                 log.warning("бот завершился с кодом %s — перезапуск через %s с", self.proc.returncode, RESTART_DELAY)
                 self.on_change()
                 time.sleep(RESTART_DELAY)
-                if self.want and not self.running:
-                    self.start()
+                with self.lock:
+                    if self.want and not self.running:
+                        self.start()
 
 
 # ---------- .env ----------
@@ -438,11 +462,17 @@ class App:
             messagebox.showinfo("Вход в Telegram", "Сначала впишите API_ID и API_HASH в «Настройки» "
                                 "(их выдают на my.telegram.org → API development tools).", parent=self.root)
             return
+        if self.bot.running:
+            # бот и вход одновременно открыли бы один файл сессии — Telegram может отозвать вход
+            if not messagebox.askyesno("Вход в Telegram", "На время входа бот будет остановлен. Продолжить?",
+                                       parent=self.root):
+                return
+            self.bot.stop()
         # отдельное окно консоли: там вводятся номер и код, приложение их не видит и не хранит
         subprocess.Popen(["cmd", "/k", python_exe(), "login.py"], cwd=APP_DIR,
                          creationflags=subprocess.CREATE_NEW_CONSOLE)
         messagebox.showinfo("Вход в Telegram", "В открывшемся окне введите номер телефона и код из Telegram. "
-                            "Когда появится «Готово», закройте его и нажмите «Перезапустить».", parent=self.root)
+                            "Когда появится «Готово», закройте его и нажмите «Запустить».", parent=self.root)
 
     # --- трей и окно ---
     def _tray(self) -> None:

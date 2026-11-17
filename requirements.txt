@@ -1,7 +1,10 @@
-aiogram>=3.20,<4
-telethon>=1.45
-curl_cffi>=0.14
-python-dotenv>=1.0
-matplotlib>=3.8
-pystray>=0.19
-pillow>=10
+# Версии зафиксированы: обновление библиотеки не должно неожиданно сломать бота (меняются только с релизом)
+aiogram==3.25.0
+aiohttp==3.13.3
+telethon==1.45.0
+curl_cffi==0.14.0
+python-dotenv==1.2.1
+matplotlib==3.10.8
+pystray==0.19.5
+pillow==11.0.0
+cryptography==44.0.0

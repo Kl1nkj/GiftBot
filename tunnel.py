@@ -55,13 +55,16 @@ class Tunnel:
         self.on_change = on_change
         self.proc: asyncio.subprocess.Process | None = None
         self.url: str | None = None
+        self._watch_task: asyncio.Task | None = None
+        if ngrok_token:  # через окружение: в командной строке токен виден в списке процессов
+            os.environ["NGROK_AUTHTOKEN"] = ngrok_token
 
     def _providers(self) -> list[tuple[str, list[str], re.Pattern]]:
         local = f"127.0.0.1:{self.port}"
         result = []
         if self.ngrok_token and self.ngrok_domain and (ngrok := find_ngrok()):
             result.append(("ngrok", [
-                ngrok, "http", local, f"--url=https://{self.ngrok_domain}", f"--authtoken={self.ngrok_token}",
+                ngrok, "http", local, f"--url=https://{self.ngrok_domain}",
                 "--log=stdout", "--log-format=logfmt",
             ], _NGROK_URL_RE))
         if cf := find_cloudflared():
@@ -96,7 +99,7 @@ class Tunnel:
         self.url = await asyncio.wait_for(self._next_url(url_re), timeout)
         # Читаем вывод дальше: чтобы буфер не переполнился и чтобы поймать смену адреса
         # (localhost.run на бесплатном тарифе иногда выдаёт новый)
-        asyncio.create_task(self._watch(url_re))
+        self._watch_task = asyncio.create_task(self._watch(url_re))
         log.info("Туннель (%s): %s", name, self.url)
         return self.url
 
@@ -117,7 +120,10 @@ class Tunnel:
                 self.url = m.group(0)
                 log.info("Туннель сменил адрес: %s", self.url)
                 if self.on_change:
-                    await self.on_change(self.url)
+                    try:
+                        await self.on_change(self.url)
+                    except Exception as e:
+                        log.warning("Туннель: не удалось обновить адрес в боте: %s", e)
 
     async def stop(self) -> None:
         if self.proc and self.proc.returncode is None:

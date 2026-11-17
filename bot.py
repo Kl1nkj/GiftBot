@@ -1,7 +1,10 @@
 import asyncio
 import html
 import logging
+import os
+import sys
 import time
+from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -22,14 +25,28 @@ from aiogram.types import (
 
 import user_client
 from charts import format_model_overview, model_chart
-from config import BOT_TOKEN, NGROK_AUTHTOKEN, NGROK_DOMAIN, OWNER_IDS, WEBAPP_HOST, WEBAPP_PORT, WEBAPP_TUNNEL, WEBAPP_URL
+from config import (
+    BASE_DIR, BOT_TOKEN, NGROK_AUTHTOKEN, NGROK_DOMAIN, OWNER_IDS, WEBAPP_DEV_NO_AUTH, WEBAPP_HOST, WEBAPP_PORT,
+    WEBAPP_TUNNEL, WEBAPP_URL,
+)
+from analytics import analysis_from_dict, format_analysis
+from config import SELL_FEES
 from models import MARKETS
 from monitor import Monitor, caption_len, format_listing, listing_from_hit
 from storage import GiftFilter, Storage
 from tunnel import Tunnel
 from webapp import start_webapp
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+if os.getenv("GIFTBOT_LOG_FILE"):
+    # из приложения: журнал с ротацией (5 файлов по 5 МБ), а не один бесконечный bot.log
+    _handler = RotatingFileHandler(BASE_DIR / os.environ["GIFTBOT_LOG_FILE"], maxBytes=5_000_000, backupCount=4,
+                                   encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[_handler])
+else:
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+# aiogram на INFO пишет строку на каждое сообщение — это шум
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 storage = Storage()
 router = Router()
@@ -44,6 +61,7 @@ HELP = (
     "/filters — мои фильтры (вкл/выкл, удалить)\n"
     "/deals — отчёт: самые выгодные лоты за сутки\n"
     "/hunt — охотник за выгодой (пороги прибыли)\n"
+    "/portfolio — журнал сделок: что купил, прибыль, точность охотника\n"
     "/status — состояние площадок\n"
     "/pause, /resume — остановить/возобновить уведомления\n"
     "/cancel — отменить ввод\n\n"
@@ -53,6 +71,10 @@ HELP = (
     "за сколько её обычно выставляют, сколько останется после комиссии при перепродаже и стоит ли брать. "
     "Охотник за выгодой сам присылает 🔥 лоты, которые можно перепродать в плюс, даже без фильтров."
 )
+
+
+class SellPosition(StatesGroup):
+    price = State()
 
 
 class AddFilter(StatesGroup):
@@ -314,7 +336,11 @@ async def status(message: Message, monitor: Monitor):
         else:
             lines.append(f"🟡 {title} — ещё не опрашивалась (нужен фильтр для этой площадки)")
     lines.append("")
-    lines.append(f"Фильтров: {len(storage.list_filters())} · уведомлений с запуска: {monitor.sent_total}")
+    lines.append(f"Фильтров: {len(storage.list_filters())} · уведомлений с запуска: {monitor.sent_total}"
+                 + (f" · повторов не прислал: {monitor.skipped_dupes}" if monitor.skipped_dupes else ""))
+    idle = time.time() - monitor.last_cycle
+    if idle > 120:
+        lines.append(f"⚠️ Мониторинг не отвечает уже {int(idle)} с — перезапусти бота")
     deals = monitor.analyzer.deal_settings()
     lines.append(
         f"🔥 Охотник за выгодой: {'вкл' if deals['enabled'] else 'выкл'} (от {deals['min_roi']:g}%) · "
@@ -375,7 +401,8 @@ def hunt_text(settings: dict) -> str:
         f"Мин. прибыль: <b>{settings['min_profit']:g} TON</b>\n"
         f"Дешевле рынка минимум на: <b>{settings['min_discount']:g}%</b>\n"
         f"Макс. цена лота: <b>{max_price}</b>\n"
-        f"Только ликвидные коллекции: <b>{'да' if settings['only_liquid'] else 'нет'}</b>\n\n"
+        f"Только ликвидные: <b>{'да' if settings['only_liquid'] else 'нет'}</b>\n"
+        f"Продать не дольше чем за: <b>{settings['max_days']:g} дн.</b> (по темпу реальных сделок модели)\n\n"
         "Изменить числа: <code>/hunt 15 1 100 7</code> — доходность %, прибыль TON, "
         "макс. цена (0 = любая), скидка к рынку %."
     )
@@ -388,6 +415,8 @@ def hunt_keyboard(settings: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=("✅ " if settings["only_liquid"] else "▫️ ") + "Только ликвидные", callback_data="hu:liq"
         )],
+        [InlineKeyboardButton(text=("• " if settings["max_days"] == v else "") + f"≤{v} дн.", callback_data=f"hu:days:{v}")
+         for v in (3, 7, 14, 30)],
         [InlineKeyboardButton(
             text=("✅ " if settings["numbers"] else "▫️ ") + "💎 Красивые номера по цене обычных",
             callback_data="hu:num",
@@ -428,6 +457,8 @@ async def hunt_cb(cb: CallbackQuery, monitor: Monitor):
         settings = analyzer.save_deal_settings({"min_roi": float(parts[2])})
     elif parts[1] == "liq":
         settings = analyzer.save_deal_settings({"only_liquid": not settings["only_liquid"]})
+    elif parts[1] == "days":
+        settings = analyzer.save_deal_settings({"max_days": float(parts[2])})
     elif parts[1] == "num":
         settings = analyzer.save_deal_settings({"numbers": not settings["numbers"]})
     try:
@@ -463,6 +494,161 @@ async def reanalyze(cb: CallbackQuery, monitor: Monitor):
             await cb.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
     except Exception as e:  # «message is not modified» и т.п.
         logging.debug("reanalyze edit: %s", e)
+
+
+@router.callback_query(F.data.startswith("fa:"))
+async def full_analysis(cb: CallbackQuery):
+    hit = storage.get_hit(int(cb.data[3:]))
+    analysis = analysis_from_dict(hit.get("analysis")) if hit else None
+    if not analysis:
+        await cb.answer("Анализа для этого лота нет", show_alert=True)
+        return
+    await cb.answer()
+    item = listing_from_hit(hit)
+    title = html.escape(item.collection) + (f" #{item.number}" if item.number is not None else "")
+    text = f"🎁 <b>{title}</b> · {html.escape(item.model or '')}" + format_analysis(item, analysis)
+    when = time.strftime("%d.%m %H:%M", time.localtime(analysis.ts or hit["ts"]))
+    text += f"\n\n<i>Цены на {when}. Свежие — «🔄 Пересчитать».</i>"
+    for i in range(0, len(text), 4000):  # длинный анализ — несколькими сообщениями
+        await cb.message.answer(text[i:i + 4000], disable_web_page_preview=True)
+
+
+# ---------- журнал сделок ----------
+@router.callback_query(F.data.startswith("bo:"))
+async def bought(cb: CallbackQuery):
+    hit = storage.get_hit(int(cb.data[3:]))
+    if not hit or hit.get("price") is None:
+        await cb.answer("Лот уже удалён из истории", show_alert=True)
+        return
+    if any(p.get("hit_id") == hit["id"] for p in storage.list_positions()):
+        await cb.answer("Уже в журнале — /portfolio", show_alert=True)
+        return
+    a = hit.get("analysis") or {}
+    pos_id = storage.add_position({
+        "hit_id": hit["id"], "status": "open", "ts": int(time.time()),
+        "collection": hit["collection"], "number": hit.get("number"), "model": hit.get("model"),
+        "backdrop": hit.get("backdrop"), "symbol": hit.get("symbol"), "market": hit["market"],
+        "price": hit["price"], "cost": a.get("buy_cost") or hit["price"], "nft_link": hit.get("nft_link"),
+        "deal": hit.get("deal"), "plan_sell": a.get("sell_price"), "plan_market": a.get("sell_market"),
+        "plan_profit": a.get("profit"),
+    })
+    await cb.answer("Записал в журнал")
+    plan = ""
+    if a.get("sell_price"):
+        plan = (f"\nПлан: выставить за {_short_ton(a['sell_price'])} на {MARKETS.get(a['sell_market'], a['sell_market'])} "
+                f"→ прибыль {_short_ton(a.get('profit'))} TON.")
+    await cb.message.answer(
+        f"📒 Записал покупку #{pos_id}: {html.escape(hit['collection'])}"
+        f"{' #' + str(hit['number']) if hit.get('number') is not None else ''} за {_short_ton(hit['price'])} TON.{plan}\n"
+        "Буду следить за флором модели и напишу, если тебя перебьют или цена сильно сдвинется. "
+        "Когда продашь — /portfolio → «Продал»."
+    )
+
+
+def _pnl(v) -> str:
+    return "—" if v is None else ("+" if v >= 0 else "−") + _short_ton(abs(v))
+
+
+def portfolio_view() -> tuple[str, InlineKeyboardMarkup]:
+    positions = storage.list_positions()
+    opened = [p for p in positions if p.get("status") == "open"]
+    closed = [p for p in positions if p.get("status") == "closed"]
+    lines = ["📒 <b>Журнал сделок</b>", ""]
+    if not positions:
+        lines.append("Пока пусто. Купил лот из уведомления — нажми под ним «✅ Купил — в журнал»: "
+                     "бот будет следить за ценой и посчитает прибыль.")
+    if opened:
+        invested = sum(p["cost"] for p in opened)
+        est = [p["market_now"]["pnl"] for p in opened if p.get("market_now")]
+        lines.append(f"<b>Открыто: {len(opened)}</b> на {_short_ton(invested)} TON"
+                     + (f", по текущим флорам {_pnl(sum(est))} TON" if est else ""))
+        for p in opened[:10]:
+            m = p.get("market_now") or {}
+            days = (time.time() - p["ts"]) / 86400
+            title = html.escape(p["collection"]) + (f" #{p['number']}" if p.get("number") is not None else "")
+            now = (f"; сейчас выставлять за {_short_ton(m['sell'])} → {_pnl(m['pnl'])}" if m else "")
+            lines.append(f"• #{p['id']} {title} · {html.escape(p.get('model') or '')} — "
+                         f"{_short_ton(p['cost'])} TON, {days:.0f} дн.{now}")
+        lines.append("")
+    if closed:
+        total = sum(p["pnl"] for p in closed)
+        cost = sum(p["cost"] for p in closed)
+        wins = sum(1 for p in closed if p["pnl"] > 0)
+        days = [(p["closed_ts"] - p["ts"]) / 86400 for p in closed]
+        lines.append(f"<b>Закрыто: {len(closed)}</b> · прибыль <b>{_pnl(total)} TON</b> "
+                     f"({total / cost * 100:+.0f}% к вложенному) · в плюс {wins} из {len(closed)} · "
+                     f"в среднем {sum(days) / len(days):.1f} дн. до продажи")
+        for p in closed[:5]:
+            title = html.escape(p["collection"]) + (f" #{p['number']}" if p.get("number") is not None else "")
+            lines.append(f"• {title}: {_short_ton(p['cost'])} → {_short_ton(p['sold_price'])} = {_pnl(p['pnl'])}")
+        lines.append("")
+    checked = [h["check"] for h in storage.list_hits(2000, int(time.time()) - 30 * 86400) if h.get("check")]
+    if checked:
+        held = sum(1 for c in checked if c["held"])
+        lines.append(f"🎯 Точность охотника: через 3 дня план продажи держался в <b>{held} из {len(checked)}</b> "
+                     f"алертов ({held / len(checked) * 100:.0f}%)")
+    rows = [[InlineKeyboardButton(text=f"💰 Продал #{p['id']}", callback_data=f"ps:{p['id']}"),
+             InlineKeyboardButton(text=f"🗑 #{p['id']}", callback_data=f"pd:{p['id']}")] for p in opened[:10]]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("portfolio"))
+async def portfolio(message: Message):
+    text, keyboard = portfolio_view()
+    await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("pd:"))
+async def position_delete(cb: CallbackQuery):
+    storage.delete_position(int(cb.data[3:]))
+    await cb.answer("Удалено из журнала")
+    text, keyboard = portfolio_view()
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except Exception as e:
+        logging.debug("portfolio edit: %s", e)
+
+
+@router.callback_query(F.data.startswith("ps:"))
+async def position_sell(cb: CallbackQuery, state: FSMContext):
+    p = storage.get_position(int(cb.data[3:]))
+    if not p or p.get("status") != "open":
+        await cb.answer("Эта покупка уже закрыта", show_alert=True)
+        return
+    await state.set_state(SellPosition.price)
+    await state.update_data(pos_id=p["id"])
+    await cb.answer()
+    market = p.get("plan_market") or p["market"]
+    await cb.message.answer(
+        f"За сколько продал #{p['id']}? Напиши цену в TON (до комиссии), можно с площадкой: "
+        f"<code>12.5</code> или <code>12.5 tonnel</code>. По умолчанию — {MARKETS.get(market, market)}. /cancel — отмена."
+    )
+
+
+@router.message(SellPosition.price)
+async def position_sold(message: Message, state: FSMContext):
+    parts = (message.text or "").replace(",", ".").split()
+    try:
+        price = float(parts[0])
+    except (IndexError, ValueError):
+        await message.answer("Не понял цену. Пример: <code>12.5</code> или <code>12.5 portals</code>")
+        return
+    p = storage.get_position((await state.get_data())["pos_id"])
+    await state.clear()
+    if not p:
+        await message.answer("Покупка не найдена")
+        return
+    market = parts[1].lower() if len(parts) > 1 and parts[1].lower() in MARKETS else (p.get("plan_market") or p["market"])
+    fee = SELL_FEES.get(market, 0.05)
+    net = round(price * (1 - fee), 3)
+    p.update(status="closed", closed_ts=int(time.time()), sold_price=price, sold_market=market, sold_net=net,
+             pnl=round(net - p["cost"], 3))
+    storage.update_position(p["id"], p)
+    plan = (f" План был {_pnl(p['plan_profit'])} TON." if p.get("plan_profit") is not None else "")
+    await message.answer(
+        f"✅ Закрыл #{p['id']}: продал за {_short_ton(price)} на {MARKETS.get(market, market)}, "
+        f"после комиссии {fee * 100:g}% — {_short_ton(net)} TON. Итог: <b>{_pnl(p['pnl'])} TON</b>.{plan}"
+    )
 
 
 @router.callback_query(F.data.startswith("md:"))
@@ -548,6 +734,7 @@ async def main():
         BotCommand(command="filters", description="Мои фильтры"),
         BotCommand(command="deals", description="Отчёт: выгодные лоты за сутки"),
         BotCommand(command="hunt", description="Охотник за выгодой"),
+        BotCommand(command="portfolio", description="Журнал сделок и прибыль"),
         BotCommand(command="status", description="Состояние площадок"),
         BotCommand(command="pause", description="Пауза"),
         BotCommand(command="resume", description="Возобновить"),
@@ -560,11 +747,20 @@ async def main():
     else:
         # убираем кнопку со старым адресом прошлого туннеля, пока не поднимется новый
         await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
-    if not webapp_url and WEBAPP_TUNNEL:
+    if not webapp_url and WEBAPP_TUNNEL and not WEBAPP_DEV_NO_AUTH:  # без проверки входа — только локально
         tunnel = Tunnel(WEBAPP_PORT, ngrok_token=NGROK_AUTHTOKEN, ngrok_domain=NGROK_DOMAIN)
     if tunnel and tunnel.available():
         tunnel_task = asyncio.create_task(keep_tunnel(bot, tunnel))
     monitor_task = asyncio.create_task(monitor.run())
+
+    def monitor_died(task: asyncio.Task) -> None:
+        # бот без мониторинга выглядит живым, но молчит — лучше упасть, сторож приложения перезапустит
+        if not task.cancelled() and task.exception():
+            logging.critical("Мониторинг остановился", exc_info=task.exception())
+            logging.shutdown()
+            os._exit(3)
+
+    monitor_task.add_done_callback(monitor_died)
     try:
         await dp.start_polling(bot)
     finally:
@@ -580,4 +776,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    (BASE_DIR / "bot.pid").write_text(str(os.getpid()))  # приложение остановит именно этот процесс
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        logging.exception("Бот упал")
+        sys.exit(1)

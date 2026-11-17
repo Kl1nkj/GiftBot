@@ -26,7 +26,7 @@ from datetime import datetime
 
 from curl_cffi.requests import AsyncSession
 
-from config import MARKETAPP_API_TOKEN, SELL_FEES, TRANSFER_COST_TON
+from config import BUY_FEES, MARKETAPP_API_TOKEN, SELL_FEES, TRANSFER_COST_TON
 from models import MARKETS, Listing, is_ton, lot_url, number_pattern, norm, portals_collection_url, slugify, strip_rarity
 from sales import SalesHistory, SalesSummary, sale_to_dict
 from storage import Storage
@@ -72,6 +72,16 @@ CROWD_UNDERCUT = 0.02
 STALE_DAYS = 7
 # Флор «одинокий», если следующий лот дороже него больше чем на столько — рынок модели редкий
 THIN_GAP = 0.25
+
+# Чистка сделок: повторная продажа того же номера чаще этого — флип/накрутка, считаем одну
+WASH_DAYS = 3
+# Вес сделки падает вдвое каждые столько дней — вчерашняя сделка важнее месячной
+SALE_HALF_LIFE = 7
+# Сделки «с тем же фоном» берём только свежие — две старые продажи не должны поднимать оценку
+COMBO_SALES_DAYS = 14
+# Ликвидность модели по реальным сделкам: в день
+MODEL_LIQUID_HIGH = 1.0
+MODEL_LIQUID_MID = 1 / 7
 
 # Ориентир доплаты за красивый номер (верхняя граница оценки, не идёт в расчёт прибыли)
 NUMBER_PREMIUM = {3: 1.5, 2: 1.2, 1: 1.05}
@@ -170,19 +180,25 @@ class Analysis:
     discount_sales: float | None = None  # насколько лот дешевле медианы реальных сделок
     sales_markets: dict = field(default_factory=dict)  # площадка → сколько сделок
     sales_list: list[dict] = field(default_factory=list)  # последние сделки
+    sales_dropped: int = 0  # сколько сделок отброшено: выбросы и повторные продажи одного номера
+    sales_7d: int = 0  # сделок модели за 7 дней
+    days_to_sell: float | None = None  # ожидаемо дней до продажи по темпу сделок модели
     sales_missing: list[str] = field(default_factory=list)  # нет входа/токена
     sales_failed: list[str] = field(default_factory=list)
     tg: dict | None = None  # оценка Telegram для этого подарка: last_sale, average, floor (TON)
     # история
     usual: float | None = None
     usual_n: int = 0
+    usual_low: float | None = None  # нижние 20% цен выставления за 7 дн. — «обычный флор» модели
+    coll_supply: int | None = None
     # коллекция
     coll_floor: float | None = None
     coll_avg_sale: float | None = None
     coll_sales24: int | None = None
     coll_listed: int | None = None
     coll_url: str | None = None  # коллекция на Portals
-    liquidity: str | None = None  # high | mid | low
+    liquidity: str | None = None  # high | mid | low (по сделкам модели, если они есть, иначе по коллекции)
+    liquidity_by: str | None = None  # model | collection
     # перепродажа
     discount: float | None = None  # насколько дешевле флора модели, доля
     discount_usual: float | None = None
@@ -190,6 +206,7 @@ class Analysis:
     sell_market: str | None = None
     sell_fee: float | None = None
     transfer: float = 0.0
+    buy_cost: float | None = None  # цена лота + комиссия покупателя площадки (BUY_FEES)
     net: float | None = None
     profit: float | None = None
     roi: float | None = None
@@ -254,13 +271,15 @@ class Analyzer:
             "only_liquid": s.get_setting("deals_only_liquid", "1") == "1",
             # присылать красивые номера, выставленные почти по цене обычных
             "numbers": s.get_setting("deals_numbers", "1") == "1",
+            # не присылать, если по темпу сделок модель будет продаваться дольше
+            "max_days": float(s.get_setting("deals_max_days", "14")),
         }
 
     def save_deal_settings(self, data: dict) -> dict:
         s = self.storage
         if "enabled" in data:
             s.set_setting("deals_enabled", "1" if data["enabled"] else "0")
-        for key in ("min_roi", "min_profit", "min_discount"):
+        for key in ("min_roi", "min_profit", "min_discount", "max_days"):
             if data.get(key) not in (None, ""):
                 s.set_setting(f"deals_{key}", str(max(0.0, float(data[key]))))
         if "max_price" in data:
@@ -305,6 +324,7 @@ class Analyzer:
                 "sales24": sales,
                 "avg_sale": volume / sales if sales else None,
                 "listed": int(c.get("listed_count") or 0),
+                "supply": int(c["supply"]) if c.get("supply") else None,
             }
         return self._collections.put("all", result)
 
@@ -494,6 +514,14 @@ class Analyzer:
             return None, len(prices)
         return statistics.median(prices), len(prices)
 
+    def usual_low(self, collection: str, model: str) -> float | None:
+        """Нижние 20% цен выставления за 7 дней — с ним честно сравнивать текущий флор
+        (медиана включает дорогие фоны и всегда выше минимума)."""
+        prices = sorted(self.storage.price_obs(norm(collection), norm(model), HISTORY_DAYS * 86400))
+        if len(prices) < MIN_HISTORY:
+            return None
+        return prices[int(len(prices) * 0.2)]
+
     # ---------- быстрый отсев для режима «охотник» ----------
     async def is_candidate(self, item: Listing, settings: dict) -> bool:
         """Дёшево (из кэша) проверяет, есть ли смысл делать полный анализ."""
@@ -538,8 +566,11 @@ class Analyzer:
             a.coll_url = portals_collection_url(coll["id"]) if coll.get("id") else None
             a.coll_sales24, a.coll_listed = coll["sales24"], coll["listed"]
             a.liquidity = "high" if coll["sales24"] >= LIQUID_HIGH else "mid" if coll["sales24"] >= LIQUID_MID else "low"
+            a.liquidity_by = "collection"
+            a.coll_supply = coll.get("supply")
 
         a.usual, a.usual_n = self.usual_price(item.collection, item.model)
+        a.usual_low = self.usual_low(item.collection, item.model)
 
         (offers, failed), (combo, combo_failed), sales, tg = await asyncio.gather(
             self.ladder(item.collection, item.model, fresh=fresh),
@@ -606,13 +637,14 @@ class Analyzer:
                 best = (net, m, fee, transfer)
         a.net, a.sell_market, a.sell_fee, a.transfer = round(best[0], 3), best[1], best[2], best[3]
         a.sell_price = target
-        a.profit = round(a.net - item.price, 3)
-        a.roi = a.profit / item.price
+        a.buy_cost = round(item.price * (1 + BUY_FEES.get(item.market, 0.0)), 3)
+        a.profit = round(a.net - a.buy_cost, 3)
+        a.roi = a.profit / a.buy_cost
 
         self._fair_value(item, a)
 
         if a.value_floor and a.value_floor > target * 1.05:
-            a.upside_profit = round(_undercut(a.value_floor) * (1 - best[2]) - best[3] - item.price, 3)
+            a.upside_profit = round(_undercut(a.value_floor) * (1 - best[2]) - best[3] - a.buy_cost, 3)
 
         # флор коллекции на Portals мог быть самим этим лотом — тогда он не опора
         coll_floor = a.coll_floor
@@ -622,15 +654,16 @@ class Analyzer:
             fee = SELL_FEES.get("portals", 0.05)
             transfer = 0.0 if item.market == "portals" else TRANSFER_COST_TON
             a.safe_net = round(_undercut(coll_floor) * (1 - fee) - transfer, 3)
-            a.safe_profit = round(a.safe_net - item.price, 3)
+            a.safe_profit = round(a.safe_net - a.buy_cost, 3)
 
         agrees = (
-            not a.usual or a.usual_n < MIN_HISTORY or abs(a.model_floor / a.usual - 1) < 0.25
+            not a.usual_low or abs(a.model_floor / a.usual_low - 1) < 0.25
             if a.model_floor else True
         )
         stale = a.floor_age is not None and a.floor_age > STALE_DAYS
         if a.sales_n >= MIN_SALES * 2:
-            a.confidence = "high"  # цена перепродажи опирается на реальные сделки
+            # цена перепродажи опирается на реальные сделки; но висящий или одинокий флор — повод не быть уверенным
+            a.confidence = "mid" if stale or a.thin else "high"
         elif a.sales_n >= MIN_SALES:
             a.confidence = "mid"
         elif stale or a.thin:
@@ -666,21 +699,33 @@ class Analyzer:
         if sales is None:
             return
         a.sales_missing, a.sales_failed = sales.missing, sales.failed
-        # сам этот подарок мог продаваться раньше — это тоже сделка с моделью, оставляем
-        recent = sales.sales[:20]  # медиана по последним сделкам — рынок мог сдвинуться за месяц
-        if not recent:
-            return
-        prices = sorted(s.price for s in recent)
-        a.sales_n = len(sales.sales)
-        a.sales_median = round(statistics.median(prices), 3)
-        a.sales_min, a.sales_max = prices[0], prices[-1]
-        for s in sales.sales:
-            a.sales_markets[s.market] = a.sales_markets.get(s.market, 0) + 1
         a.sales_list = [sale_to_dict(s) for s in sales.sales[:10]]
+        # сам этот подарок мог продаваться раньше — это тоже сделка с моделью, оставляем
+        clean = clean_sales(sales.sales)
+        a.sales_dropped = len(sales.sales) - len(clean)
+        now = time.time()
+        a.sales_7d = sum(1 for s in clean if now - s.ts <= 7 * 86400)
+        # ликвидность самой модели: редкая модель может продаваться раз в неделю даже в ходовой коллекции
+        sources_ok = [m for m in ("portals", "tonnel", "marketapp") if m not in sales.missing and m not in sales.failed]
+        if sources_ok:
+            per_day = a.sales_7d / 7 if a.sales_7d else len(clean) / 30
+            a.liquidity = "high" if per_day >= MODEL_LIQUID_HIGH else "mid" if per_day >= MODEL_LIQUID_MID else "low"
+            a.liquidity_by = "model"
+            a.days_to_sell = round(1 / per_day, 1) if per_day else None
+        if not clean:
+            return
+        prices = sorted(s.price for s in clean)
+        a.sales_n = len(clean)
+        a.sales_median = round(weighted_median([(s.price, _recency(s.ts, now)) for s in clean]), 3)
+        a.sales_min, a.sales_max = prices[0], prices[-1]
+        for s in clean:
+            a.sales_markets[s.market] = a.sales_markets.get(s.market, 0) + 1
         a.discount_sales = 1 - item.price / a.sales_median
-        same = [s.price for s in sales.sales if item.backdrop and norm(s.backdrop) == norm(item.backdrop)]
+        same = [s for s in clean if item.backdrop and norm(s.backdrop) == norm(item.backdrop)
+                and now - s.ts <= COMBO_SALES_DAYS * 86400]
         if same:
-            a.combo_sales_n, a.combo_sales_median = len(same), round(statistics.median(same), 3)
+            a.combo_sales_n = len(same)
+            a.combo_sales_median = round(weighted_median([(s.price, _recency(s.ts, now)) for s in same]), 3)
 
     async def _features(self, item: Listing, a: Analysis) -> None:
         """Объясняет цену: редкость модели/фона/символа, дорогие фон и символ, монохром, связка, номер."""
@@ -738,7 +783,7 @@ class Analyzer:
                      f"сочетание ценится дороже (часто это монохром или удачные цвета)")
             why.append("ценное сочетание")
 
-        a.number_tier, label = number_pattern(item.number)
+        a.number_tier, label = number_pattern(item.number, a.coll_supply)
         if label:
             f.append(label + (" — за такие часто доплачивают" if a.number_tier >= 2 else ""))
         if a.number_tier >= 2:
@@ -772,7 +817,8 @@ class Analyzer:
         if a.sales_n >= MIN_SALES:
             base, a.fair_basis = a.sales_median, f"по {a.sales_n} сделкам за 30 дн."
         elif a.model_floor and not stale and not a.thin:
-            base, a.fair_basis = a.model_floor, "по самой дешёвой цене в продаже (сделок мало)"
+            base, a.fair_basis = a.model_floor, "по самой дешёвой цене в продаже" + (
+                " (сделок мало)" if a.liquidity_by == "model" else "")
         elif a.usual:
             base, a.fair_basis = a.usual, "по ценам выставления за 7 дн."
         else:
@@ -782,6 +828,15 @@ class Analyzer:
         elif a.value_floor and a.value_floor > base:
             base = a.value_floor
             a.fair_basis += ", с учётом фона/символа"
+        # дороже такого же лота, который прямо сейчас лежит в продаже, оценивать нельзя
+        cap = None
+        if a.combo_floor and not (a.combo_count == 1 and a.combo_floor > base * 1.5):
+            cap = a.combo_floor
+        elif a.model_floor and not stale and not a.thin:
+            cap = max(a.model_floor, a.value_floor or 0)
+        if cap and cap < base:
+            base = cap
+            a.fair_basis += "; не дороже такого же в продаже"
         a.fair = round(base, 2)
         premium = NUMBER_PREMIUM.get(a.number_tier, 1.0)
         if premium > 1:
@@ -808,18 +863,27 @@ class Analyzer:
             reasons.append(f"прибыль {a.profit:.2f} TON — меньше {s['min_profit']:g} TON")
             good = False
         # с реальными сделками запас считаем от них, иначе — от самого дешёвого в продаже
-        disc = a.discount_sales if a.sales_n >= MIN_SALES else a.discount
+        stale = a.floor_age is not None and a.floor_age > STALE_DAYS
+        floor_disc = a.discount if a.discount is not None and not stale and not a.thin else None
+        if a.sales_n >= MIN_SALES:
+            disc = min(a.discount_sales, floor_disc) if floor_disc is not None else a.discount_sales
+        else:
+            disc = a.discount
         if disc is not None and disc * 100 < s["min_discount"]:
             reasons.append(f"всего на {disc * 100:.0f}% дешевле рынка — запас слишком маленький")
             good = False
         if a.liquidity == "low":
-            reasons.append("коллекция продаётся редко — можно долго ждать покупателя")
+            what = "модель покупают редко" if a.liquidity_by == "model" else "коллекция продаётся редко"
+            reasons.append(f"{what} — можно долго ждать покупателя")
             if s["only_liquid"]:
                 good = False
+        if a.days_to_sell is not None and a.days_to_sell > s["max_days"]:
+            reasons.append(f"по темпу сделок продажа займёт ~{a.days_to_sell:.0f} дн. — дольше порога {s['max_days']:g} дн.")
+            good = False
         if a.crowd >= CROWD_SIZE:
             reasons.append(f"у флора {a.crowd} конкурентов — цена перепродажи взята на {CROWD_UNDERCUT * 100:g}% ниже флора")
-        if a.usual and a.usual_n >= MIN_HISTORY and a.model_floor and a.model_floor < a.usual * 0.85:
-            reasons.append("модель сейчас дешевеет — флор ниже обычной цены")
+        if a.usual_low and a.model_floor and a.model_floor < a.usual_low * 0.85:
+            reasons.append("модель сейчас дешевеет — флор ниже, чем обычно был всю неделю")
             good = False
         safe = a.safe_profit is not None and a.safe_profit >= 0
         if a.sales_n >= MIN_SALES and a.sell_price is not None and a.model_floor \
@@ -857,6 +921,40 @@ async def _empty() -> tuple[list[Offer], list[str]]:
     return [], []
 
 
+def _recency(ts: float, now: float) -> float:
+    return 0.5 ** (max(0.0, now - ts) / 86400 / SALE_HALF_LIFE)
+
+
+def weighted_median(pairs: list[tuple[float, float]]) -> float:
+    """Медиана с весами: [(значение, вес)]."""
+    pairs = sorted(pairs)
+    total = sum(w for _, w in pairs)
+    acc = 0.0
+    for value, w in pairs:
+        acc += w
+        if acc >= total / 2:
+            return value
+    return pairs[-1][0]
+
+
+def clean_sales(sales: list) -> list:
+    """Убирает накрутку и выбросы: повторные продажи одного номера за WASH_DAYS (оставляем последнюю)
+    и цены за пределами 1.5×IQR (если сделок хватает, чтобы судить)."""
+    kept, last_by_number = [], {}
+    for s in sorted(sales, key=lambda s: -s.ts):
+        if s.number is not None:
+            prev = last_by_number.get(s.number)
+            if prev is not None and prev - s.ts < WASH_DAYS * 86400:
+                continue
+            last_by_number[s.number] = s.ts
+        kept.append(s)
+    if len(kept) >= 5:
+        q1, _, q3 = statistics.quantiles([s.price for s in kept], n=4)
+        lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+        kept = [s for s in kept if lo <= s.price <= hi]
+    return kept
+
+
 GRADES = {
     "top": "🏆 Топ-лот",
     "number": "💎 Красивый номер",
@@ -878,6 +976,7 @@ VERDICTS = {
 }
 LIQUIDITY = {"high": "высокая", "mid": "средняя", "low": "низкая"}
 CONFIDENCE = {"high": "высокая", "mid": "средняя", "low": "низкая (мало лотов для сравнения)"}
+CONF_SHORT = {"high": "высокая", "mid": "средняя", "low": "низкая"}
 
 
 def _ton(v: float | None) -> str:
@@ -886,18 +985,67 @@ def _ton(v: float | None) -> str:
     return f"{v:,.2f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
+def _days(d: float) -> str:
+    return "меньше дня" if d < 1 else f"{d:.0f} дн."
+
+
 def _pct(v: float) -> str:
     return f"{v * 100:+.0f}%".replace("+-", "−").replace("-", "−")
+
+
+def analysis_from_dict(data: dict | None) -> Analysis | None:
+    if not data:
+        return None
+    names = Analysis.__dataclass_fields__
+    return Analysis(**{k: v for k, v in data.items() if k in names})
+
+
+def _fair_line(a: Analysis) -> str:
+    d = a.fair_discount or 0
+    rel = f"лот на <b>{abs(d) * 100:.0f}% {'дешевле' if d > 0 else 'дороже'}</b> оценки" if abs(d) >= 0.01 \
+        else "лот стоит ровно по оценке"
+    return f"🧮 <b>Оценка рынка: ~{_ton(a.fair)} TON</b> ({a.fair_basis}) — {rel}"
+
+
+def _sell_lines(a: Analysis) -> list[str]:
+    where = MARKETS.get(a.sell_market, a.sell_market)
+    sign = "+" if a.profit >= 0 else "−"
+    lines = [f"💡 Продать на {where} за {_ton(a.sell_price)} → чистыми {_ton(a.net)} · "
+             f"<b>прибыль {sign}{_ton(abs(a.profit))} TON ({_pct(a.roi)})</b>"]
+    if a.safe_profit is not None and a.profit > 0:
+        s = "+" if a.safe_profit >= 0 else "−"
+        lines.append(f"Худший случай (по флору коллекции): {s}{_ton(abs(a.safe_profit))} TON")
+    return lines
+
+
+def format_analysis_short(item: Listing, a: Analysis) -> str:
+    """Короткий анализ для уведомления: влезает в подпись к картинке. Полный — кнопкой «📊 Подробно»."""
+    lines = [""]
+    if a.fair is not None:
+        lines.append(_fair_line(a))
+    if a.model_floor is not None:
+        age = f", висит {a.floor_age:.0f} дн." if a.floor_age is not None and a.floor_age >= 1 else ""
+        lines.append(f"Такая же модель от <b>{_ton(a.model_floor)} TON</b> ({MARKETS.get(a.floor_market, a.floor_market)}{age})")
+    if a.sales_n:
+        lines.append(f"💸 Сделок за 30 дн.: {a.sales_n}, середина {_ton(a.sales_median)} TON"
+                     + (f" · ⏱ продать ~{_days(a.days_to_sell)}" if a.days_to_sell is not None else ""))
+    elif a.ok and not a.sales_missing and not a.sales_failed:
+        lines.append("💸 За 30 дней модель ни разу не купили")
+    if a.ok:
+        lines.extend(_sell_lines(a))
+    lines.append(f"<b>{VERDICTS[a.verdict]}</b>" + (f" · надёжность {CONF_SHORT.get(a.confidence, '—')}" if a.ok else ""))
+    for r in a.reasons[:3]:
+        lines.append(f"• {r}")
+    if len(a.reasons) > 3:
+        lines.append(f"• …ещё {len(a.reasons) - 3} — в «📊 Подробно»")
+    return "\n".join(lines)
 
 
 def format_analysis(item: Listing, a: Analysis) -> str:
     """Блок анализа для уведомления в Telegram (HTML)."""
     lines = ["", "📊 <b>Анализ</b>"]
     if a.fair is not None:
-        d = a.fair_discount or 0
-        rel = f"лот на <b>{abs(d) * 100:.0f}% {'дешевле' if d > 0 else 'дороже'}</b> оценки" if abs(d) >= 0.01 \
-            else "лот стоит ровно по оценке"
-        lines.append(f"🧮 <b>Оценка рынка: ~{_ton(a.fair)} TON</b> ({a.fair_basis}) — {rel}")
+        lines.append(_fair_line(a))
         if a.fair_high:
             lines.append(f"За номер можно просить до ~{_ton(a.fair_high)} TON (ориентир, продаётся дольше)")
     if a.model_floor is not None:
@@ -912,7 +1060,7 @@ def format_analysis(item: Listing, a: Analysis) -> str:
         parts += [f"{MARKETS.get(m, m)} нет" for m in LADDER_MARKETS if m not in a.market_floors and m not in a.partial]
         parts += [f"{MARKETS.get(m, m)} не ответил" for m in a.partial]
         lines.append("По площадкам: " + " · ".join(parts))
-    if a.sales_n:
+    if a.sales_n and a.sales_list:
         where = ", ".join(f"{MARKETS.get(m, m.capitalize())} {n}" for m, n in a.sales_markets.items())
         last = a.sales_list[0]
         ago = max(0, (time.time() - last["ts"]) / 86400)
@@ -920,7 +1068,10 @@ def format_analysis(item: Listing, a: Analysis) -> str:
             f"💸 Реально купили за 30 дн.: <b>{a.sales_n}</b> раз ({where}), середина <b>{_ton(a.sales_median)} TON</b>, "
             f"от {_ton(a.sales_min)} до {_ton(a.sales_max)}; последняя — {_ton(last['price'])} "
             f"{'сегодня' if ago < 1 else f'{ago:.0f} дн. назад'}"
+            + (f"; отброшено {a.sales_dropped} (выбросы/перепродажи одного номера)" if a.sales_dropped else "")
         )
+    if a.days_to_sell is not None:
+        lines.append(f"⏱ Темп: {a.sales_7d} сделок за 7 дн. → продать займёт ~{_days(a.days_to_sell)}")
     elif not a.sales_n and a.ok and not a.sales_missing and not a.sales_failed:
         lines.append("💸 За 30 дней эту модель ни разу не купили")
     if a.tg and (a.tg.get("last_sale") or a.tg.get("average")):
@@ -959,6 +1110,8 @@ def format_analysis(item: Listing, a: Analysis) -> str:
         lines.append("")
         where = MARKETS.get(a.sell_market, a.sell_market)
         transfer = f" − перевод {_ton(a.transfer)}" if a.transfer else ""
+        if a.buy_cost and item.price and a.buy_cost > item.price + 0.001:
+            lines.append(f"Покупка с комиссией площадки: {_ton(a.buy_cost)} TON")
         lines.append(
             f"💡 Перепродать: выставить на {where} за {_ton(a.sell_price)} → "
             f"после комиссии {a.sell_fee * 100:g}%{transfer} ≈ <b>{_ton(a.net)} TON</b>"

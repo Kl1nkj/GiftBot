@@ -3,7 +3,13 @@ import time
 
 from telethon import functions, types
 
-from config import STARS_PER_TON, USER_CLIENT_ENABLED
+import config
+from config import USER_CLIENT_ENABLED
+
+
+def set_stars_per_ton(value: float) -> None:
+    """Обновляется монитором по живому курсу TON (если STARS_PER_TON не задан в .env)."""
+    config.STARS_PER_TON = value
 from models import Listing, norm
 from sources.base import Source
 from user_client import get_client
@@ -93,7 +99,8 @@ class TelegramMarketSource(Source):
             if stars is not None and not gift.resale_ton_only:
                 price_text = f"{ton:g} TON / {stars} ⭐"
         elif stars is not None:
-            price, price_text = stars / STARS_PER_TON, f"{stars} ⭐ (~{stars / STARS_PER_TON:.2f} TON)"
+            rate = config.STARS_PER_TON
+            price, price_text = stars / rate, f"{stars} ⭐ (~{stars / rate:.2f} TON)"
         else:
             price, price_text = None, None
 

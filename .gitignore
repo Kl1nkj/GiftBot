@@ -10,3 +10,10 @@ app.log
 backup/
 __pycache__/
 *.pyc
+bot.err.log
+bot.pid
+bot.log.*
+data.db-wal
+data.db-shm
+*.db-wal
+*.db-shm

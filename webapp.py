@@ -37,9 +37,13 @@ def check_init_data(init_data: str) -> dict | None:
     expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, received_hash):
         return None
-    if time.time() - int(pairs.get("auth_date", 0)) > INIT_DATA_TTL:
+    try:
+        if time.time() - int(pairs.get("auth_date", 0)) > INIT_DATA_TTL:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+    except (ValueError, TypeError):
         return None
-    return json.loads(pairs.get("user", "{}"))
+    return user if isinstance(user, dict) else None
 
 
 @web.middleware
@@ -300,6 +304,8 @@ def create_app(storage: Storage, monitor) -> web.Application:
 
 
 async def start_webapp(storage: Storage, monitor, host: str, port: int) -> web.AppRunner:
+    if WEBAPP_DEV_NO_AUTH:  # без проверки входа API доступен всем, кто достучится, — только с этого компьютера
+        host = "127.0.0.1"
     runner = web.AppRunner(create_app(storage, monitor))
     await runner.setup()
     await web.TCPSite(runner, host, port).start()

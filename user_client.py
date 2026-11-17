@@ -1,4 +1,5 @@
 """Telegram-аккаунт пользователя (Telethon). Нужен официальному маркету и для входа в MRKT."""
+import asyncio
 from urllib.parse import parse_qs, urlparse
 
 from telethon import TelegramClient, functions, types, utils
@@ -6,17 +7,21 @@ from telethon import TelegramClient, functions, types, utils
 from config import API_HASH, API_ID, SESSION_PATH, USER_CLIENT_ENABLED
 
 _client: TelegramClient | None = None
+# Площадки опрашиваются параллельно: без блокировки два источника могли открыть user.session одновременно
+# (database is locked, а то и AUTH_KEY_DUPLICATED — тогда Telegram отзывает вход)
+_lock = asyncio.Lock()
 
 
 async def get_client() -> TelegramClient | None:
     global _client
     if not USER_CLIENT_ENABLED:
         return None
-    if _client is None:
-        _client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-        await _client.connect()
-    if not _client.is_connected():
-        await _client.connect()
+    async with _lock:
+        if _client is None:
+            _client = TelegramClient(SESSION_PATH, API_ID, API_HASH, flood_sleep_threshold=30)
+            await _client.connect()
+        if not _client.is_connected():
+            await _client.connect()
     if not await _client.is_user_authorized():
         raise RuntimeError("аккаунт не авторизован — запустите один раз: python login.py")
     return _client

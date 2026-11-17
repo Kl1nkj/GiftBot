@@ -33,10 +33,11 @@ def strip_rarity(value: str | None) -> str | None:
     return _PERCENT_RE.sub("", value).strip() if value else value
 
 
-def number_pattern(n: int | None) -> tuple[int, str | None]:
+def number_pattern(n: int | None, supply: int | None = None) -> tuple[int, str | None]:
     """Насколько «красивый» номер подарка: (уровень 0–3, описание). Коллекционеры за такие часто доплачивают.
     3 — топ (#1–#100, одинаковые цифры 7777), 2 — заметный (повтор 183183, круглый 50000, 1234, до #1000),
-    1 — слабый (зеркальный 12321, оканчивается на 000)."""
+    1 — слабый (зеркальный 12321, оканчивается на 000).
+    supply — тираж коллекции: «до #1000» ценится только в больших коллекциях (в тираже 3000 это треть)."""
     if n is None or n <= 0:
         return 0, None
     s = str(n)
@@ -57,7 +58,9 @@ def number_pattern(n: int | None) -> tuple[int, str | None]:
     if len(s) >= 4 and steps in ({1}, {-1}):
         return 2, f"номер-последовательность #{n}"
     if n <= 1000:
-        return 2, f"низкий номер #{n}"
+        if supply is None or supply >= 20000:
+            return 2, f"низкий номер #{n}"
+        return 1, f"низкий номер #{n} (в тираже {supply})"
     if len(s) >= 4 and s == s[::-1]:
         return 1, f"зеркальный номер #{n}"
     if len(s) >= 5 and s.endswith("000"):

@@ -57,9 +57,12 @@ class GiftFilter:
 
 class Storage:
     def __init__(self, path: str = DB_PATH):
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        self.db.execute("PRAGMA journal_mode=WAL")  # чтение не ждёт записи, база не бьётся при обрыве
         self.db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS alerts (ident TEXT PRIMARY KEY, ts INTEGER NOT NULL, price REAL);
+            CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS filters (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, ts INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -102,8 +105,13 @@ class Storage:
         return set(keys) - seen
 
     def mark_seen(self, keys) -> None:
+        """Время обновляется при каждом появлении лота: чистка удаляет только пропавшие лоты,
+        и висящий дольше двух недель лот не придёт повторно как новый."""
         now = int(time.time())
-        self.db.executemany("INSERT OR IGNORE INTO seen (key, ts) VALUES (?, ?)", [(k, now) for k in keys])
+        self.db.executemany(
+            "INSERT INTO seen (key, ts) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts",
+            [(k, now) for k in keys],
+        )
         self.db.commit()
 
     def prune_seen(self, max_age_days: int = 14) -> None:
@@ -113,7 +121,7 @@ class Storage:
     # --- найденные лоты (лента в мини-приложении) ---
     def add_hit(self, data: dict) -> int:
         cur = self.db.execute("INSERT INTO hits (ts, data) VALUES (?, ?)", (int(time.time()), json.dumps(data, ensure_ascii=False)))
-        self.db.execute("DELETE FROM hits WHERE id <= (SELECT MAX(id) - 1000 FROM hits)")
+        self.db.execute("DELETE FROM hits WHERE id <= (SELECT MAX(id) - 5000 FROM hits)")
         self.db.commit()
         return cur.lastrowid
 
@@ -159,6 +167,42 @@ class Storage:
     def prune_price_obs(self, max_age_days: int = 30) -> None:
         self.db.execute("DELETE FROM price_obs WHERE ts < ?", (int(time.time()) - max_age_days * 86400,))
         self.db.commit()
+
+    # --- антиспам: последний алерт по подарку ---
+    def last_alert(self, ident: str, max_age: int) -> float | None:
+        row = self.db.execute(
+            "SELECT price FROM alerts WHERE ident = ? AND ts >= ?", (ident, int(time.time()) - max_age)
+        ).fetchone()
+        return row[0] if row else None
+
+    def save_alert(self, ident: str, price: float | None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO alerts (ident, ts, price) VALUES (?, ?, ?)",
+                        (ident, int(time.time()), price))
+        self.db.execute("DELETE FROM alerts WHERE ts < ?", (int(time.time()) - 7 * 86400,))
+        self.db.commit()
+
+    # --- журнал сделок (купленные подарки) ---
+    def add_position(self, data: dict) -> int:
+        cur = self.db.execute("INSERT INTO positions (data) VALUES (?)", (json.dumps(data, ensure_ascii=False),))
+        self.db.commit()
+        return cur.lastrowid
+
+    def get_position(self, pos_id: int) -> dict | None:
+        row = self.db.execute("SELECT id, data FROM positions WHERE id = ?", (pos_id,)).fetchone()
+        return {**json.loads(row[1]), "id": row[0]} if row else None
+
+    def update_position(self, pos_id: int, data: dict) -> None:
+        clean = {k: v for k, v in data.items() if k != "id"}
+        self.db.execute("UPDATE positions SET data = ? WHERE id = ?", (json.dumps(clean, ensure_ascii=False), pos_id))
+        self.db.commit()
+
+    def delete_position(self, pos_id: int) -> None:
+        self.db.execute("DELETE FROM positions WHERE id = ?", (pos_id,))
+        self.db.commit()
+
+    def list_positions(self) -> list[dict]:
+        rows = self.db.execute("SELECT id, data FROM positions ORDER BY id DESC").fetchall()
+        return [{**json.loads(d), "id": i} for i, d in rows]
 
     # --- настройки ---
     def get_setting(self, key: str, default: str | None = None) -> str | None:

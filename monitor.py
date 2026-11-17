@@ -7,20 +7,28 @@ import time
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from analytics import Analysis, Analyzer, format_analysis, grade_line
-from config import OWNER_IDS
-from models import MARKETS, Listing, norm
+from analytics import Analysis, Analyzer, _undercut, format_analysis_short, grade_line
+from config import OWNER_IDS, SELL_FEES, STAR_USD, STARS_PER_TON_FIXED
+from models import MARKETS, Listing, is_ton, norm
 from sources.base import Source
 from sources.fragment import FragmentSource
 from sources.getgems import GetGemsSource
 from sources.marketapp import MarketAppSource
 from sources.mrkt import MrktSource
 from sources.portals import PortalsSource
-from sources.telegram_market import TelegramMarketSource
+from sources.telegram_market import TelegramMarketSource, set_stars_per_ton
 from sources.tonnel import TonnelSource
 from storage import GiftFilter, Storage
 
 log = logging.getLogger("monitor")
+
+FETCH_TIMEOUT = 90  # зависший запрос к площадке не должен останавливать её опрос навсегда
+REALERT_HOURS = 24  # тот же подарок повторно — только если подешевел заметнее, чем на REALERT_DROP
+REALERT_DROP = 0.03
+MODEL_ALERTS_PER_HOUR = 3  # охотник: не больше стольких алертов по одной модели в час (волна демпинга)
+POSITIONS_EVERY = 20 * 60  # как часто проверять купленные подарки
+FLOOR_MOVE = 0.10  # о движении флора купленной модели сообщаем от 10%
+CHECK_AFTER_DAYS = 3  # через сколько дней проверять, сбылся ли план алерта
 
 
 def fmt_price(item: Listing) -> str:
@@ -47,7 +55,7 @@ def format_listing(
         if value:
             lines.append(f"{label}: {html.escape(value)}")
     if analysis is not None:
-        lines.append(format_analysis(item, analysis))
+        lines.append(format_analysis_short(item, analysis))
     buttons = []
     if item.url:
         buttons.append(InlineKeyboardButton(text=f"🛒 Лот на {MARKETS.get(item.market, item.market)}", url=item.url))
@@ -59,8 +67,17 @@ def format_listing(
     if hit_id is not None and item.model:
         rows.append([InlineKeyboardButton(text=f"👀 {item.model}: в продаже, сделки, график", callback_data=f"md:{hit_id}")])
     if hit_id is not None:
-        rows.append([InlineKeyboardButton(text="🔄 Пересчитать", callback_data=f"ra:{hit_id}")])
+        rows.append([
+            InlineKeyboardButton(text="📊 Подробно", callback_data=f"fa:{hit_id}"),
+            InlineKeyboardButton(text="🔄 Пересчитать", callback_data=f"ra:{hit_id}"),
+        ])
+        if item.price is not None and is_ton(item.currency):
+            rows.append([InlineKeyboardButton(text="✅ Купил — в журнал", callback_data=f"bo:{hit_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _t(v: float | None) -> str:
+    return "—" if v is None else f"{v:,.2f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
 def caption_len(text: str) -> int:
@@ -93,6 +110,9 @@ class Monitor:
         self.analyzer = Analyzer(storage)
         self.sent_total = 0
         self.deals_total = 0
+        self.skipped_dupes = 0
+        self.last_cycle = time.time()  # для /status и сторожа: монитор жив
+        self._model_alerts: dict[tuple[str, str], list[float]] = {}
 
     @property
     def paused(self) -> bool:
@@ -109,16 +129,135 @@ class Monitor:
         return wanted
 
     async def run(self) -> None:
-        last_prune = 0.0
+        """Каждая площадка опрашивается в своей задаче: медленная или упавшая не задерживает остальные."""
+        await asyncio.gather(self._housekeeping(), self._positions_loop(),
+                             *(self._source_loop(s) for s in self.sources))
+
+    async def _housekeeping(self) -> None:
         while True:
-            now = time.time()
-            if now - last_prune > 3600:
+            try:
                 self.storage.prune_seen()
                 self.storage.prune_price_obs()
-                last_prune = now
-            due = [s for s in self.sources if s.available and s.next_run <= now]
-            if due and not self.paused:
-                await asyncio.gather(*(self._poll(s) for s in due))
+            except Exception:
+                log.exception("чистка базы")
+            if not STARS_PER_TON_FIXED:
+                try:
+                    usd = await self.analyzer.sales.ton_rate("USD")
+                    if usd:
+                        set_stars_per_ton(round(usd / STAR_USD, 1))
+                except Exception as e:
+                    log.debug("курс TON: %s", e)
+            await asyncio.sleep(3600)
+
+    # ---------- купленные подарки ----------
+    async def _positions_loop(self) -> None:
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await self.check_positions()
+                await self.calibrate()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("проверка купленных подарков")
+            await asyncio.sleep(POSITIONS_EVERY)
+
+    async def position_market(self, p: dict) -> dict | None:
+        """Текущий рынок модели для купленного подарка: флор без него самого и сколько выйдет чистыми."""
+        offers, _ = await self.analyzer.ladder(p["collection"], p["model"])
+        others = [o for o in offers if o.number != p.get("number")]
+        if not others:
+            return None
+        mine = next((o for o in offers if p.get("number") is not None and o.number == p["number"]), None)
+        floor = others[0]
+        sell = _undercut(floor.price)
+        net = round(sell * (1 - SELL_FEES.get(floor.market, 0.05)), 3)
+        return {"floor": floor.price, "floor_market": floor.market, "sell": sell, "net": net,
+                "pnl": round(net - p["cost"], 3), "mine": mine.price if mine else None,
+                "mine_market": mine.market if mine else None}
+
+    async def check_positions(self, notify: bool = True) -> None:
+        for p in self.storage.list_positions():
+            if p.get("status") != "open" or not p.get("model"):
+                continue
+            try:
+                m = await self.position_market(p)
+            except Exception as e:
+                log.warning("позиция %s: %s", p["id"], e)
+                continue
+            if not m:
+                continue
+            msgs = []
+            last = p.get("notified_floor")
+            if last and abs(m["floor"] / last - 1) >= FLOOR_MOVE:
+                msgs.append(f"флор модели {'упал' if m['floor'] < last else 'вырос'}: {_t(last)} → <b>{_t(m['floor'])} TON</b>")
+            if last is None or msgs:
+                p["notified_floor"] = m["floor"]
+            if m["mine"] is not None and m["mine"] > m["floor"] and p.get("undercut_floor") != m["floor"]:
+                msgs.append(f"тебя перебили: твой лот за {_t(m['mine'])}, а такой же уже за {_t(m['floor'])} "
+                            f"на {MARKETS.get(m['floor_market'], m['floor_market'])}")
+                p["undercut_floor"] = m["floor"]
+            if m["pnl"] < 0 and not p.get("loss_warned"):
+                msgs.append("по текущему флору продажа уже в минус")
+                p["loss_warned"] = True
+            elif m["pnl"] >= 0:
+                p["loss_warned"] = False
+            p.update(market_now=m, checked=int(time.time()))
+            self.storage.update_position(p["id"], p)
+            if msgs and notify:
+                title = html.escape(p["collection"]) + (f" #{p['number']}" if p.get("number") is not None else "")
+                sign = "+" if m["pnl"] >= 0 else "−"
+                text = "\n".join([
+                    f"📒 <b>{title}</b> · {html.escape(p['model'])} — куплен за {_t(p['cost'])} TON",
+                    *(f"• {x}" for x in msgs),
+                    f"💡 Сейчас выставлять за <b>{_t(m['sell'])}</b> на {MARKETS.get(m['floor_market'], m['floor_market'])} "
+                    f"→ чистыми {_t(m['net'])} ({sign}{_t(abs(m['pnl']))} TON)",
+                ])
+                for chat_id in OWNER_IDS:
+                    try:
+                        await self.bot.send_message(chat_id, text, disable_web_page_preview=True)
+                    except Exception as e:
+                        log.warning("позиция → %s: %s", chat_id, e)
+
+    async def calibrate(self, limit: int = 15) -> None:
+        """Через CHECK_AFTER_DAYS дней после алерта смотрим, держится ли план продажи — так видно,
+        насколько охотнику можно верить (итог в /portfolio)."""
+        now = time.time()
+        done = 0
+        for h in self.storage.list_hits(2000, int(now - 30 * 86400)):
+            a = h.get("analysis") or {}
+            if not h.get("deal") or not a.get("ok") or "check" in h or not h.get("model"):
+                continue
+            if now - h["ts"] < CHECK_AFTER_DAYS * 86400:
+                continue
+            try:
+                offers, failed = await self.analyzer.ladder(h["collection"], h["model"])
+            except Exception as e:
+                log.debug("проверка алерта %s: %s", h["id"], e)
+                continue
+            if failed:
+                continue
+            others = [o for o in offers if o.number != h.get("number")]
+            floor = others[0].price if others else None
+            h["check"] = {"ts": int(now), "floor": floor, "plan": a.get("sell_price"),
+                          "held": bool(floor and a.get("sell_price") and _undercut(floor) >= a["sell_price"] * 0.97)}
+            self.storage.update_hit(h["id"], h)
+            done += 1
+            if done >= limit:
+                break
+
+    async def _source_loop(self, source: Source) -> None:
+        while True:
+            self.last_cycle = time.time()
+            try:
+                if source.available and source.next_run <= time.time() and not self.paused:
+                    await self._poll(source)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # любая ошибка — в лог и повтор позже, но опрос не умирает
+                log.exception("%s: цикл опроса упал", source.name)
+                source.last_error = f"{type(e).__name__}: {e}"[:300]
+                source.next_run = time.time() + max(source.interval * 3, 60)
             await asyncio.sleep(1)
 
     async def _poll(self, source: Source) -> None:
@@ -130,11 +269,13 @@ class Monitor:
         if not deals["enabled"] and source.seeded and (not filters or (wanted is not None and not wanted)):
             return
         try:
-            items = await source.fetch(wanted)
+            items = await asyncio.wait_for(source.fetch(wanted), FETCH_TIMEOUT)
             source.mark_ok(len(items))
         except Exception as e:  # площадка недоступна или поменяла API — пробуем снова позже
-            source.last_error = f"{type(e).__name__}: {e}"[:300]
-            source.next_run = time.time() + max(source.interval * 3, 60)
+            source.last_error = f"{type(e).__name__}: {e}"[:300] if str(e) else type(e).__name__
+            # Telegram просит подождать (FloodWait) — ждём не меньше, иначе рискуем аккаунтом
+            flood = getattr(e, "seconds", None)
+            source.next_run = time.time() + max(source.interval * 3, 60, (flood or 0) + 5)
             log.warning("%s: %s", source.name, source.last_error)
             return
 
@@ -148,32 +289,36 @@ class Monitor:
             return
 
         for item in new_items:
-            if item.extra.get("seed"):
-                continue
-            candidates = [f for f in filters if f.matches_basic(item)]
-            if not candidates and not deals["enabled"]:
-                continue
-            if item.needs_details and not candidates and not await self._worth_details(item):
-                continue
-            if item.needs_details:
-                try:
-                    await source.load_details(item)
-                    self.analyzer.record([item])
-                except Exception as e:
-                    log.warning("%s details: %s", source.name, e)
+            await self._handle(source, item, filters, deals)
+            self.storage.mark_seen([item.key])  # сразу: если цикл упадёт дальше, этот лот не придёт второй раз
+        self.storage.mark_seen([i.key for i in items])
+
+    async def _handle(self, source: Source, item: Listing, filters: list[GiftFilter], deals: dict) -> None:
+        if item.extra.get("seed"):
+            return
+        candidates = [f for f in filters if f.matches_basic(item)]
+        if not candidates and not deals["enabled"]:
+            return
+        if item.needs_details and not candidates and not await self._worth_details(item):
+            return
+        if item.needs_details:
             try:
-                if any(f.matches(item) for f in candidates):
-                    await self._notify(item, await self._analyze(item))
-                elif deals["enabled"] and await self.analyzer.is_candidate(item, deals):
-                    # для охотника стакан всегда свежий: при волне демпинга кэш показал бы устаревший флор
-                    analysis = await self._analyze(item, fresh=True)
-                    if analysis and analysis.verdict == "buy":
-                        await self._notify(item, analysis, deal=True)
-                    elif analysis and deals["numbers"] and self._cheap_number(item, analysis):
-                        await self._notify(item, analysis, deal="number")
+                await source.load_details(item)
+                self.analyzer.record([item])
             except Exception as e:
-                log.warning("%s notify: %s", source.name, e)
-        self.storage.mark_seen(unseen)
+                log.warning("%s details: %s", source.name, e)
+        try:
+            if any(f.matches(item) for f in candidates):
+                await self._notify(item, await self._analyze(item))
+            elif deals["enabled"] and await self.analyzer.is_candidate(item, deals):
+                # для охотника стакан всегда свежий: при волне демпинга кэш показал бы устаревший флор
+                analysis = await self._analyze(item, fresh=True)
+                if analysis and analysis.verdict == "buy":
+                    await self._notify(item, analysis, deal=True)
+                elif analysis and deals["numbers"] and self._cheap_number(item, analysis):
+                    await self._notify(item, analysis, deal="number")
+        except Exception as e:
+            log.warning("%s notify: %s", source.name, e)
 
     @staticmethod
     def _cheap_number(item: Listing, a: Analysis) -> bool:
@@ -199,7 +344,26 @@ class Monitor:
             log.warning("анализ %s: %s", item.key, e)
             return None
 
+    def _is_repeat(self, item: Listing, deal: bool | str) -> bool:
+        """Тот же подарок (перецена на копейку или он же на другой площадке) и волна одной модели — не спамим."""
+        ident = f"{norm(item.collection)}#{item.number}" if item.number is not None else item.key
+        prev = self.storage.last_alert(ident, REALERT_HOURS * 3600)
+        if prev is not None and item.price is not None and item.price > prev * (1 - REALERT_DROP):
+            return True
+        if deal and item.model:
+            key = (norm(item.collection), norm(item.model))
+            recent = [t for t in self._model_alerts.get(key, []) if time.time() - t < 3600]
+            if len(recent) >= MODEL_ALERTS_PER_HOUR:
+                return True
+            self._model_alerts[key] = recent + [time.time()]
+        self.storage.save_alert(ident, item.price)
+        return False
+
     async def _notify(self, item: Listing, analysis: Analysis | None = None, deal: bool | str = False) -> None:
+        if self._is_repeat(item, deal):
+            self.skipped_dupes += 1
+            log.info("повтор, не шлю: %s %s", item.key, deal)
+            return
         hit_id = self.storage.add_hit(
             {
                 "deal": deal,
